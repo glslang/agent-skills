@@ -9,6 +9,7 @@ Skills live under `.claude/skills/<skill-name>/`. Claude Code discovers them aut
 | Skill | What it does |
 |---|---|
 | [`merge-dependabot-prs`](.claude/skills/merge-dependabot-prs/SKILL.md) | Walks the open Dependabot PR queue oldest-first and merges each PR once CI is green. Diagnoses CI failures and either pushes a fix to the bot's branch or opens a follow-up PR. One stuck PR never blocks the rest of the queue. |
+| [`release-rust-crates-io`](.claude/skills/release-rust-crates-io/SKILL.md) | Releases a Rust crate to crates.io: user-confirmed version bump, mandatory preflight checks, repo-convention git tag, GitHub release, publish, and smoke test against the published version from crates.io. |
 
 ## Using a skill in another repo
 
