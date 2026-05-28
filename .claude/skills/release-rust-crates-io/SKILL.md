@@ -21,7 +21,7 @@ cargo metadata --no-deps --format-version 1
 Determine:
 
 - **Package name** and **current version** from the target crate's `Cargo.toml` (`[package].name`, `[package].version`).
-- **Workspace?** If multiple publishable crates, list them and confirm which to release (or release in dependency order — leaf crates first).
+- **Workspace?** If multiple publishable crates, list them and confirm which to release (or release in dependency order — dependencies before dependents).
 - **Default branch** (`main` / `master`).
 
 If `[package].publish = false`, stop — crate is not publishable.
@@ -207,7 +207,7 @@ Use a temp directory outside the source repo:
 ```bash
 SMOKE=$(mktemp -d)
 cd "$SMOKE"
-cargo init --name <crate-name>-smoke --bin smoke
+cargo init --name <crate-name>-smoke --bin
 ```
 
 Pin the **published** version (no path dependency):
