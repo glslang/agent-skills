@@ -1,6 +1,6 @@
 ---
 name: sweep-dependabot-prs
-description: Run the merge-dependabot-prs skill across many repos at once. Discovers every repo the user can push to that has open Dependabot PRs created within a time window (default 2 years), and/or takes an explicit list of repo names, then clears each repo's queue in turn. Use when the user asks to "merge dependabot PRs across all my repos", "sweep my repos for dependabot PRs", "clear dependabot queues everywhere", "bulk merge bot updates in these repos", or similar multi-repo requests.
+description: Run the merge-dependabot-prs skill across many repos at once. Discovers repos with open Dependabot PRs created within a time window (default 2 years) — the user's own repos by default, org repos on explicit request — and/or takes an explicit list of repo names, then clears each repo's queue in turn. Use when the user asks to "merge dependabot PRs across all my repos", "sweep my repos for dependabot PRs", "clear dependabot queues everywhere", "bulk merge bot updates in these repos", or similar multi-repo requests.
 ---
 
 # Sweep Dependabot PRs Across Repos
@@ -19,13 +19,20 @@ Resolve the run parameters from the user's request:
 
 - **Window** — how far back a Dependabot PR's *creation date* may be. Default: **2 years**. "all" / "everything" disables the filter.
 - **Repo list** — explicit names, if given. Normalize bare names (`myrepo`) to `LOGIN/myrepo`; if the user belongs to multiple orgs and a bare name is ambiguous, ask.
-- **Scope** — for discovery: default is repos owned by `LOGIN`. Only include orgs if the user asks ("including my orgs" → add each of `gh api user/orgs --jq '.[].login'` as an extra `--owner`).
+- **Scope** — for discovery: default is repos owned by `LOGIN`. Only include orgs if the user asks ("including my orgs" → add each of `gh api --paginate user/orgs --jq '.[].login'` as an extra `--owner`). Discovery never sees repos where the user is only an outside collaborator — those must be named explicitly in the repo list.
 
 Both filters combine: an explicit list restricts *which repos*, the window restricts *which PRs* inside them.
 
+Build the date filter **once**, as optional arguments every later `gh pr list` reuses — so a window of "all" omits the filter everywhere, not just in discovery:
+
 ```bash
-# Cutoff date for the window (pick the variant that works on this platform)
-CUTOFF=$(date -v-2y +%Y-%m-%d 2>/dev/null || date -d '2 years ago' +%Y-%m-%d)
+if [[ "$WINDOW" == "all" ]]; then
+  CREATED_FILTER=()
+else
+  # Cutoff date (pick the variant that works on this platform)
+  CUTOFF=$(date -v-2y +%Y-%m-%d 2>/dev/null || date -d '2 years ago' +%Y-%m-%d)
+  CREATED_FILTER=(--search "created:>=$CUTOFF")
+fi
 ```
 
 ## 1. Build the target list
@@ -56,8 +63,12 @@ For each name, confirm there is anything to do (and apply the window):
 
 ```bash
 gh pr list -R "$REPO" --author 'app/dependabot' --state open \
-  --search "created:>=$CUTOFF" --json number,createdAt --jq length
+  "${CREATED_FILTER[@]}" --json number,createdAt --jq length
 ```
+
+### Both modes together (explicit list + "and anything else")
+
+Take the **union** of the explicit list and the discovery results, de-duplicated by full `owner/name`. Explicitly named repos are never silently dropped: one with zero PRs in the window still appears in the final report as "nothing in window". Discovered repos merely join the list — they never displace a named one. The entire union then goes through the eligibility filter below.
 
 ### Filter to repos you can actually merge in
 
@@ -82,19 +93,20 @@ Print the target table — repo, open Dependabot PR count, oldest PR date — pl
 
 Process repos in table order (oldest outstanding PR first). For each repo, **follow the entire `merge-dependabot-prs` procedure** with these adaptations:
 
-1. **No `cd` needed for the happy path.** Add `-R "$REPO"` to every `gh pr`/`gh repo` call in the base skill. Do not clone up front.
+1. **No `cd` needed for the happy path.** Add `-R "$REPO"` to **every** repo-scoped `gh` call in the base skill — `gh pr`, `gh repo`, and the `gh run view`/`gh run rerun` calls in its CI-failure steps (2e). A `gh run` command without `-R` resolves against the current checkout, which is *not* the target repo. Do not clone up front.
 2. **Apply the window inside the repo too**: base skill step 1 becomes
    ```bash
    gh pr list -R "$REPO" --author 'app/dependabot' --state open \
-     --search "created:>=$CUTOFF" \
+     "${CREATED_FILTER[@]}" \
      --json number,title,createdAt,headRefName,baseRefName,mergeable,mergeStateStatus \
      --jq 'sort_by(.createdAt)'
    ```
-3. **Clone lazily.** Only when a fix must be authored locally (base skill steps 2e/2f) do:
+3. **Clone lazily.** Only when local git work is needed — a fix authored locally (base skill steps 2e/2f) or the manual-rebase fallback when Dependabot ignores two `@dependabot rebase` comments (step 2b) — do:
    ```bash
-   gh repo clone "$REPO" "$SCRATCH/$(basename "$REPO")" -- --filter=blob:none
+   DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
+   gh repo clone "$REPO" "$DEST" -- --filter=blob:none
    ```
-   into the scratchpad directory, and work there. Delete or leave per scratchpad convention when the repo is done.
+   and work there. Delete or leave per scratchpad convention when the repo is done.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
