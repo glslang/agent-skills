@@ -65,7 +65,7 @@ Omit `--created` entirely when the window is "all".
 For each name, confirm there is anything to do (and apply the window):
 
 ```bash
-gh pr list -R "$REPO" --author 'app/dependabot' --state open \
+gh pr list -R "$REPO" --author 'app/dependabot' --state open --limit 1000 \
   "${CREATED_FILTER[@]}" --json number,createdAt --jq length
 ```
 
@@ -99,7 +99,7 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
 1. **No `cd` needed for the happy path.** Add `-R "$REPO"` to **every** repo-scoped `gh` call in the base skill — `gh pr`, `gh repo`, and the `gh run view`/`gh run rerun` calls in its CI-failure steps (2e). A `gh run` command without `-R` resolves against the current checkout, which is *not* the target repo. Do not clone up front.
 2. **Apply the window inside the repo too**: base skill step 1 becomes
    ```bash
-   gh pr list -R "$REPO" --author 'app/dependabot' --state open \
+   gh pr list -R "$REPO" --author 'app/dependabot' --state open --limit 1000 \
      "${CREATED_FILTER[@]}" \
      --json number,title,createdAt,headRefName,baseRefName,mergeable,mergeStateStatus \
      --jq 'sort_by(.createdAt)'
@@ -107,6 +107,7 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
 3. **Clone lazily.** Only when local git work is needed — a fix authored locally (base skill steps 2e/2f) or the manual-rebase fallback when Dependabot ignores two `@dependabot rebase` comments (step 2b) — do:
    ```bash
    SCRATCH="${SCRATCH:-$(mktemp -d -t dependabot-sweep)}"   # session scratchpad dir if one exists, else a fresh temp dir
+   mkdir -p "$SCRATCH"   # in case $SCRATCH was preset to a path that doesn't exist yet
    DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
    gh repo clone "$REPO" "$DEST" -- --filter=blob:none
    ```
