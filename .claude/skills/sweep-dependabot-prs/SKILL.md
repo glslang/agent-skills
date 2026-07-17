@@ -29,7 +29,10 @@ Build the date filter **once**, as optional arguments every later `gh pr list` r
 if [[ "$WINDOW" == "all" ]]; then
   CREATED_FILTER=()
 else
-  # Cutoff date (pick the variant that works on this platform)
+  # Derive the cutoff from the RESOLVED window — shown here for the 2-year default.
+  # Swap the offset to match the request: "past 6 months" → -v-6m / '6 months ago',
+  # "last 90 days" → -v-90d / '90 days ago', etc. Never leave it at 2y for a
+  # narrower request — that sweeps PRs the user didn't ask about.
   CUTOFF=$(date -v-2y +%Y-%m-%d 2>/dev/null || date -d '2 years ago' +%Y-%m-%d)
   CREATED_FILTER=(--search "created:>=$CUTOFF")
 fi
@@ -103,6 +106,7 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    ```
 3. **Clone lazily.** Only when local git work is needed — a fix authored locally (base skill steps 2e/2f) or the manual-rebase fallback when Dependabot ignores two `@dependabot rebase` comments (step 2b) — do:
    ```bash
+   SCRATCH="${SCRATCH:-$(mktemp -d -t dependabot-sweep)}"   # session scratchpad dir if one exists, else a fresh temp dir
    DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
    gh repo clone "$REPO" "$DEST" -- --filter=blob:none
    ```
