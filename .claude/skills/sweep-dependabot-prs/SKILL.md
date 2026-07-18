@@ -27,18 +27,22 @@ Both filters combine: an explicit list restricts *which repos*, the window restr
 
 Build the date filter **once** as optional arguments the later commands reuse — so a window of "all" omits the filter everywhere. Two forms are needed because `gh search prs` spells it `--created <expr>` while `gh pr list` spells it `--search "created:>=<date>"`:
 
-First **resolve the requested window into a date offset**, then derive the cutoff from it. The offset is a required step — the 2-year value below is only the default when the user named no window; a narrower request must set `OFFSET_*` to match, or the sweep pulls PRs the user didn't ask about.
+Normalize the user's request into `WINDOW` first: either the literal `all`, or a `<N> <unit>` string (`day`/`week`/`month`/`year`, plural tolerated), defaulting to `2 years` when the user named no window. The cutoff is then computed from `WINDOW` — nothing downstream is hard-coded, so "past 6 months" genuinely narrows the sweep in both discovery and per-repo listing:
 
 ```bash
 if [[ "$WINDOW" == "all" ]]; then
   CREATED_FILTER=()       # for gh pr list (list mode + per-repo loop)
   DISCOVERY_CREATED=()    # for gh search prs (discovery)
 else
-  # Set BOTH from the resolved window (BSD date / GNU date forms). Defaults = 2 years.
-  #   "past 6 months" → OFFSET_BSD="-v-6m"  OFFSET_GNU="6 months ago"
-  #   "last 90 days"  → OFFSET_BSD="-v-90d" OFFSET_GNU="90 days ago"
-  OFFSET_BSD="-v-2y"; OFFSET_GNU="2 years ago"
-  CUTOFF=$(date "$OFFSET_BSD" +%Y-%m-%d 2>/dev/null || date -d "$OFFSET_GNU" +%Y-%m-%d)
+  read -r N UNIT <<<"${WINDOW:-2 years}"   # e.g. "6 months" → N=6 UNIT=months
+  case "${UNIT%s}" in                      # strip trailing plural
+    day)   BSD="-v-${N}d"; GNU="$N days ago"   ;;
+    week)  BSD="-v-${N}w"; GNU="$N weeks ago"  ;;
+    month) BSD="-v-${N}m"; GNU="$N months ago" ;;
+    year)  BSD="-v-${N}y"; GNU="$N years ago"  ;;
+    *) echo "unrecognized window unit: $UNIT" >&2; exit 1 ;;
+  esac
+  CUTOFF=$(date "$BSD" +%Y-%m-%d 2>/dev/null || date -d "$GNU" +%Y-%m-%d)   # BSD then GNU date
   CREATED_FILTER=(--search "created:>=$CUTOFF")
   DISCOVERY_CREATED=(--created ">=$CUTOFF")
 fi
@@ -124,30 +128,35 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    mkdir -p "$SCRATCH"   # in case $SCRATCH was preset to a path that doesn't exist yet
    DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
 
+   # First transport that works wins. Each fallback wipes $DEST first, so a partial
+   # dir left by a failed attempt can't fail the next clone on the same path.
    if [ -d "$DEST/.git" ]; then
-     git -C "$DEST" fetch origin   # reuse the existing checkout for a later PR in the same repo
+     git -C "$DEST" fetch origin   # reuse the checkout from an earlier PR in this repo
    elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 \
-        && gh repo clone "$REPO" "$DEST" -- --filter=blob:none; then
-     :   # cloned via gh (which also leaves a pushable remote per its own config)
-   elif timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 \
-        | grep -qi 'successfully authenticated'; then
-     git clone --filter=blob:none "git@github.com:$REPO.git" "$DEST"   # SSH key works: private clone + pushable origin
-   elif timeout 15 git ls-remote "https://github.com/$REPO.git" >/dev/null 2>&1; then
-     git clone --filter=blob:none "https://github.com/$REPO.git" "$DEST"   # HTTPS via credential helper
+        && rm -rf "$DEST" && gh repo clone "$REPO" "$DEST" -- --filter=blob:none; then
+     :
+   elif timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated' \
+        && rm -rf "$DEST" && git clone --filter=blob:none "git@github.com:$REPO.git" "$DEST"; then
+     :
+   elif timeout 15 git ls-remote "https://github.com/$REPO.git" >/dev/null 2>&1 \
+        && rm -rf "$DEST" && git clone --filter=blob:none "https://github.com/$REPO.git" "$DEST"; then
+     :
    else
-     echo "no git transport can reach $REPO — skip to API-only remediation for this PR"
+     DEST=""   # no transport reached the repo — no local-fix path (handled below)
    fi
 
-   # Only with a real checkout: put the PR's branch in a clean state, even if $DEST
-   # was reused from an earlier PR. HEAD_REF is this PR's headRefName (from step 2's JSON).
-   if [ -d "$DEST/.git" ]; then
+   if [ -n "$DEST" ]; then
+     # Clean branch state even if $DEST was reused. HEAD_REF is this PR's headRefName (step 2 JSON).
      git -C "$DEST" fetch origin "$HEAD_REF"
      git -C "$DEST" checkout -B "$HEAD_REF" "origin/$HEAD_REF"
+     # Authoritative push gate: read access (ls-remote) doesn't imply push. A dry-run
+     # authenticates and verifies write access without changing the remote.
+     git -C "$DEST" push --dry-run origin "$HEAD_REF" >/dev/null 2>&1 || DEST=""
    fi
    ```
-   Delete or leave `$DEST` per scratchpad convention when the repo is done.
+   With a usable checkout (`$DEST` non-empty), **run the base skill's local commands inside it** — either `cd "$DEST"` for the duration of the fix and `cd` back before the next repo, or prefix each with `git -C "$DEST"`. Step 3's "no `cd`" rule is about the *happy path*; the local-fix path genuinely operates in `$DEST`, and forgetting this would commit to the sweep's own checkout. Delete or leave `$DEST` per scratchpad convention when the repo is done.
 
-   **Gate the local-fix path on real Git reachability, and never let a probe hang.** Preference order is: reuse an existing checkout → `gh repo clone` (only if it actually succeeds — a passing `gh auth status` doesn't guarantee it) → plain `git` over SSH when the key authenticates → plain `git` over HTTPS. Every probe runs non-interactively (`GIT_TERMINAL_PROMPT=0`, SSH `BatchMode=yes`) under a `timeout`, so a credential prompt or dead network can't stall the sequential sweep — a timed-out probe counts as "unavailable" and falls through. Only when **no** transport can reach GitHub — e.g. a locked-down web sandbox — is there no local-fix path: restrict remediation to the options the base skill supports without a checkout (re-run a flaky job, comment `@dependabot rebase`/`recreate`), otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
+   **Gate the local-fix path on real push capability, and never let a probe hang.** Preference order: reuse an existing checkout → `gh repo clone` (only if it actually succeeds — a passing `gh auth status` doesn't guarantee it) → plain `git` over SSH when the key authenticates → plain `git` over HTTPS. Reachability probes run non-interactively (`GIT_TERMINAL_PROMPT=0`, SSH `BatchMode=yes`) under a `timeout`, so a prompt or dead network can't stall the sweep — a timed-out probe counts as unavailable. Reachability isn't enough, though: `ls-remote` proves only *read* access, so the `push --dry-run` above is the real gate (GitHub-side write was already confirmed by step 1's eligibility filter; this confirms the local transport can actually push). When `$DEST` ends up empty — no transport, or reachable but not push-capable — there's no local-fix path: restrict remediation to the options the base skill supports without a checkout (re-run a flaky job, comment `@dependabot rebase`/`recreate`), otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
