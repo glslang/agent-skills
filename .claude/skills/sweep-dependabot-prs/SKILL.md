@@ -25,11 +25,12 @@ Resolve the run parameters from the user's request:
 
 Both filters combine: an explicit list restricts *which repos*, the window restricts *which PRs* inside them.
 
-Build the date filter **once**, as optional arguments every later `gh pr list` reuses — so a window of "all" omits the filter everywhere, not just in discovery:
+Build the date filter **once** as optional arguments the later commands reuse — so a window of "all" omits the filter everywhere. Two forms are needed because `gh search prs` spells it `--created <expr>` while `gh pr list` spells it `--search "created:>=<date>"`:
 
 ```bash
 if [[ "$WINDOW" == "all" ]]; then
-  CREATED_FILTER=()
+  CREATED_FILTER=()       # for gh pr list (list mode + per-repo loop)
+  DISCOVERY_CREATED=()    # for gh search prs (discovery)
 else
   # Derive the cutoff from the RESOLVED window — shown here for the 2-year default.
   # Swap the offset to match the request: "past 6 months" → -v-6m / '6 months ago',
@@ -37,6 +38,7 @@ else
   # narrower request — that sweeps PRs the user didn't ask about.
   CUTOFF=$(date -v-2y +%Y-%m-%d 2>/dev/null || date -d '2 years ago' +%Y-%m-%d)
   CREATED_FILTER=(--search "created:>=$CUTOFF")
+  DISCOVERY_CREATED=(--created ">=$CUTOFF")
 fi
 ```
 
@@ -51,7 +53,7 @@ gh search prs \
   --author app/dependabot \
   --state open \
   --owner "$LOGIN" \
-  --created ">=$CUTOFF" \
+  "${DISCOVERY_CREATED[@]}" \
   --archived=false \
   --limit 1000 \
   --json repository,number,createdAt \
@@ -60,7 +62,7 @@ gh search prs \
         | sort_by(.oldest)'
 ```
 
-Omit `--created` entirely when the window is "all".
+`DISCOVERY_CREATED` is empty when the window is "all", so no date qualifier is sent.
 
 ### List mode (user named repos)
 
