@@ -122,6 +122,8 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    fi
    ```
    and work there (`git -C "$DEST" checkout <headRefName>`). Delete or leave per scratchpad convention when the repo is done.
+
+   **No-`gh` (MCP) mode has no local-fix path** — cloning and pushing branches need `gh` (or ambient git credentials the web sandbox lacks). When a PR there would require local git work, don't attempt the clone; restrict remediation to the API-only options the base skill already supports without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — and otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
