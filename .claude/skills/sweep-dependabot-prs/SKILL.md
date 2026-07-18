@@ -121,14 +121,21 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    if [ -d "$DEST/.git" ]; then
      git -C "$DEST" fetch origin   # reuse the existing checkout for a later PR in the same repo
    elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-     gh repo clone "$REPO" "$DEST" -- --filter=blob:none
+     gh repo clone "$REPO" "$DEST" -- --filter=blob:none   # gh picks the protocol from its own config
    else
-     git clone --filter=blob:none "https://github.com/$REPO.git" "$DEST"   # plain git, using SSH/credential-helper auth
+     # Plain git: use SSH when the key authenticates (so a private clone works and origin stays pushable),
+     # otherwise HTTPS via a credential helper.
+     if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated'; then
+       REMOTE="git@github.com:$REPO.git"
+     else
+       REMOTE="https://github.com/$REPO.git"
+     fi
+     git clone --filter=blob:none "$REMOTE" "$DEST"
    fi
    ```
    and work there (`git -C "$DEST" checkout <headRefName>`). Delete or leave per scratchpad convention when the repo is done.
 
-   **When local git can't reach the remote, drop to API-only remediation.** The gate is *Git capability*, not the presence of `gh`: a no-`gh` environment with SSH keys or a credential helper can still clone and push, so use the plain-`git` path above. Only when neither `gh` nor git credentials can reach GitHub — e.g. a locked-down web sandbox — is there no local-fix path. Probe once (a failing `git ls-remote "https://github.com/$REPO.git" >/dev/null 2>&1` with no credential fallback signals this); when confirmed unreachable, restrict remediation to the options the base skill supports without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — and otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
+   **When local git can't reach the remote, drop to API-only remediation.** The gate is *Git capability*, not the presence of `gh`: a no-`gh` environment with SSH keys or a credential helper can still clone and push, so use the plain-`git` path above. Only when neither `gh` nor git credentials can reach GitHub — e.g. a locked-down web sandbox — is there no local-fix path. Probe once against whichever protocol the environment offers (`git ls-remote git@github.com:$REPO.git` for SSH, `git ls-remote https://github.com/$REPO.git` for HTTPS); if both fail, restrict remediation to the options the base skill supports without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — and otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
