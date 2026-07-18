@@ -123,40 +123,20 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    ```
 3. **Clone lazily, once per repo.** Only when local git work is needed — a fix authored locally (base skill steps 2e/2f) or the manual-rebase fallback when Dependabot ignores two `@dependabot rebase` comments (step 2b) — do:
    ```bash
-   export GIT_TERMINAL_PROMPT=0   # never block on an interactive credential prompt
    SCRATCH="${SCRATCH:-$(mktemp -d "${TMPDIR:-/tmp}/dependabot-sweep.XXXXXX")}"   # session scratchpad if set, else a fresh temp dir
-   mkdir -p "$SCRATCH"   # in case $SCRATCH was preset to a path that doesn't exist yet
+   mkdir -p "$SCRATCH"
    DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
-
-   # First transport that works wins. Each fallback wipes $DEST first, so a partial
-   # dir left by a failed attempt can't fail the next clone on the same path.
    if [ -d "$DEST/.git" ]; then
-     git -C "$DEST" fetch origin   # reuse the checkout from an earlier PR in this repo
-   elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 \
-        && rm -rf "$DEST" && gh repo clone "$REPO" "$DEST" -- --filter=blob:none; then
-     :
-   elif timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated' \
-        && rm -rf "$DEST" && git clone --filter=blob:none "git@github.com:$REPO.git" "$DEST"; then
-     :
-   elif timeout 15 git ls-remote "https://github.com/$REPO.git" >/dev/null 2>&1 \
-        && rm -rf "$DEST" && git clone --filter=blob:none "https://github.com/$REPO.git" "$DEST"; then
-     :
+     git -C "$DEST" fetch origin              # reuse the checkout from an earlier PR in this repo
    else
-     DEST=""   # no transport reached the repo — no local-fix path (handled below)
+     gh repo clone "$REPO" "$DEST" -- --filter=blob:none
    fi
-
-   if [ -n "$DEST" ]; then
-     # Clean branch state even if $DEST was reused. HEAD_REF is this PR's headRefName (step 2 JSON).
-     git -C "$DEST" fetch origin "$HEAD_REF"
-     git -C "$DEST" checkout -B "$HEAD_REF" "origin/$HEAD_REF"
-     # Authoritative push gate: read access (ls-remote) doesn't imply push. A dry-run
-     # authenticates and verifies write access without changing the remote.
-     git -C "$DEST" push --dry-run origin "$HEAD_REF" >/dev/null 2>&1 || DEST=""
-   fi
+   git -C "$DEST" fetch origin "$HEAD_REF"    # HEAD_REF = this PR's headRefName (step 2 JSON)
+   git -C "$DEST" checkout -B "$HEAD_REF" "origin/$HEAD_REF"   # clean branch state even if $DEST was reused
    ```
-   With a usable checkout (`$DEST` non-empty), **run the base skill's local commands inside it** — either `cd "$DEST"` for the duration of the fix and `cd` back before the next repo, or prefix each with `git -C "$DEST"`. Step 3's "no `cd`" rule is about the *happy path*; the local-fix path genuinely operates in `$DEST`, and forgetting this would commit to the sweep's own checkout. Delete or leave `$DEST` per scratchpad convention when the repo is done.
+   **Run the base skill's local commands inside `$DEST`** — `cd "$DEST"` for the fix and `cd` back before the next repo, or prefix each with `git -C "$DEST"`. Step 3's "no `cd`" rule is about the happy path; the local-fix path genuinely operates in `$DEST`. Delete or leave `$DEST` per scratchpad convention when done.
 
-   **Gate the local-fix path on real push capability, and never let a probe hang.** Preference order: reuse an existing checkout → `gh repo clone` (only if it actually succeeds — a passing `gh auth status` doesn't guarantee it) → plain `git` over SSH when the key authenticates → plain `git` over HTTPS. Reachability probes run non-interactively (`GIT_TERMINAL_PROMPT=0`, SSH `BatchMode=yes`) under a `timeout`, so a prompt or dead network can't stall the sweep — a timed-out probe counts as unavailable. Reachability isn't enough, though: `ls-remote` proves only *read* access, so the `push --dry-run` above is the real gate (GitHub-side write was already confirmed by step 1's eligibility filter; this confirms the local transport can actually push). When `$DEST` ends up empty — no transport, or reachable but not push-capable — there's no local-fix path: restrict remediation to the options the base skill supports without a checkout (re-run a flaky job, comment `@dependabot rebase`/`recreate`), otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
+   **Local fixes need `gh` or push-capable git credentials.** In a restricted environment with neither (e.g. Claude Code on the web), skip the clone: restrict remediation to what the base skill does over the API without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — otherwise skip the PR with a note. The queue keeps moving.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
