@@ -64,12 +64,15 @@ Omit `--created` entirely when the window is "all".
 
 ### List mode (user named repos)
 
-For each name, confirm there is anything to do (and apply the window):
+For each name, capture the same `{count, oldest}` shape discovery produces — the confirmation table shows each repo's oldest PR and the loop runs oldest-first, so a bare count isn't enough:
 
 ```bash
 gh pr list -R "$REPO" --author 'app/dependabot' --state open --limit 1000 \
-  "${CREATED_FILTER[@]}" --json number,createdAt --jq length
+  "${CREATED_FILTER[@]}" --json number,createdAt \
+  --jq '{repo: "'"$REPO"'", prs: length, oldest: (if length == 0 then null else (map(.createdAt) | min) end)}'
 ```
+
+Repos with `prs == 0` still appear in the report ("nothing in window"); those with PRs join the same oldest-first ordering as discovered repos.
 
 **MCP:** `mcp__github__list_pull_requests` (`state: "open"`), keep `user.login == "dependabot[bot]"`, and filter `created_at >= CUTOFF` in the result (unless the window is "all").
 
@@ -117,13 +120,15 @@ Process repos in table order (oldest outstanding PR first). For each repo, **fol
    DEST="$SCRATCH/${REPO//\//__}"   # owner__name: two repos sharing a basename must not share a checkout
    if [ -d "$DEST/.git" ]; then
      git -C "$DEST" fetch origin   # reuse the existing checkout for a later PR in the same repo
-   else
+   elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
      gh repo clone "$REPO" "$DEST" -- --filter=blob:none
+   else
+     git clone --filter=blob:none "https://github.com/$REPO.git" "$DEST"   # plain git, using SSH/credential-helper auth
    fi
    ```
    and work there (`git -C "$DEST" checkout <headRefName>`). Delete or leave per scratchpad convention when the repo is done.
 
-   **No-`gh` (MCP) mode has no local-fix path** — cloning and pushing branches need `gh` (or ambient git credentials the web sandbox lacks). When a PR there would require local git work, don't attempt the clone; restrict remediation to the API-only options the base skill already supports without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — and otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
+   **When local git can't reach the remote, drop to API-only remediation.** The gate is *Git capability*, not the presence of `gh`: a no-`gh` environment with SSH keys or a credential helper can still clone and push, so use the plain-`git` path above. Only when neither `gh` nor git credentials can reach GitHub — e.g. a locked-down web sandbox — is there no local-fix path. Probe once (a failing `git ls-remote "https://github.com/$REPO.git" >/dev/null 2>&1` with no credential fallback signals this); when confirmed unreachable, restrict remediation to the options the base skill supports without a checkout — re-run a flaky job, comment `@dependabot rebase`/`recreate` — and otherwise skip the PR with a note. The queue keeps moving; only PRs that genuinely need hand-authored fixes are deferred.
 4. **Repo-level failure never blocks the sweep.** If a repo errors in a way that isn't about one PR (auth, permissions changed mid-run, repo transferred), log it under "skipped repos" and continue with the next repo.
 5. **Pace between repos.** Sleep ~10s between repos on long sweeps; on any 403/429 back off 60s before continuing (search + merge traffic across many repos hits secondary rate limits sooner than a single-repo run).
 
