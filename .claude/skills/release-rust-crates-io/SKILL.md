@@ -1,11 +1,11 @@
 ---
 name: release-rust-crates-io
-description: Release a Rust crate to crates.io with mandatory preflight checks, user-confirmed version bump and git tag (following repo tag conventions), GitHub release, and post-publish verification from crates.io. Use when the user asks to release or publish a Rust crate, ship a version to crates.io, cut a crate release, tag and publish a Rust library, or run a crates.io release workflow.
+description: Release a Rust crate to crates.io with mandatory preflight checks, user-confirmed version bump and git tag (following repo tag conventions), a required green-CI gate on the released commit before publishing, GitHub release, and post-publish verification from crates.io. Use when the user asks to release or publish a Rust crate, ship a version to crates.io, cut a crate release, tag and publish a Rust library, or run a crates.io release workflow.
 ---
 
 # Release Rust Crate to crates.io
 
-End-to-end release: confirm version → mandatory preflight checks → user-confirmed tag → `cargo publish` → GitHub tag/release → smoke test against the published crate on crates.io.
+End-to-end release: confirm version → mandatory preflight checks → user-confirmed tag → green CI on the released commit → `cargo publish` → GitHub tag/release → smoke test against the published crate on crates.io.
 
 **Every step and every check is mandatory.** Do not skip, defer, or proceed on failure. Stop and ask the user only when a gate fails or a decision is required.
 
@@ -158,6 +158,40 @@ If the version bump commit is not yet on the remote, push the branch first:
 git push origin HEAD
 ```
 
+## 5a. Wait for remote CI (required)
+
+Step 3 only ever exercises **one** host — one OS, one architecture, one toolchain. A crate whose behavior depends on target ABI, pointer width, endianness, or OS APIs can pass every local check and still be broken on a platform the project supports. `cargo publish` is irreversible: a version can be yanked, never replaced. So gate the publish on the project's own CI, run against the exact commit being released.
+
+Find the runs for the release commit:
+
+```bash
+gh run list --commit "$(git rev-parse HEAD)" --json databaseId,name,status,conclusion
+```
+
+Then either watch each run (`--exit-status` makes a failed run a non-zero exit):
+
+```bash
+gh run watch <run-id> --exit-status
+```
+
+or poll until every run on the commit has finished, then print the verdicts:
+
+```bash
+until [ -z "$(gh run list --commit "$(git rev-parse HEAD)" \
+    --json status --jq '.[] | select(.status != "completed")')" ]; do sleep 20; done
+gh run list --commit "$(git rev-parse HEAD)" --json name,conclusion \
+  --jq '.[] | "\(.name): \(.conclusion)"'
+```
+
+Gate on the outcome:
+
+- **Every run `success`** → proceed to step 6.
+- **Any run `failure` / `cancelled` / `timed_out`** → **stop, do not publish.** Report which job failed. The tag is already pushed; fix forward with a new version rather than trying to reuse this one.
+- **No CI configured**, or no runs exist for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
+- **Still running after ~20 min** → report what's outstanding and ask. Don't block forever, and don't publish on a pending matrix.
+
+If required checks only run on pull requests and the release commit landed directly on the default branch, there may be no runs for that SHA. Fall back to the checks on the PR that introduced it, or to explicit user confirmation — and note the gap in the final report.
+
 ## 6. Publish to crates.io
 
 Verify credentials (token in `~/.cargo/credentials.json` — do not print it). Re-run dry-run, then publish:
@@ -250,6 +284,7 @@ Print:
 - **Tag:** `<proposed-tag>` pushed to origin (convention: …)
 - **GitHub release:** URL (`gh release view <proposed-tag> --json url -q .url`)
 - **Checks:** all mandatory checks passed
+- **CI:** all runs green on the released commit (or the documented exception, if the user approved one)
 - **Smoke test:** passed against crates.io `=<confirmed-version>`
 
 ## Workspace releases
@@ -270,11 +305,12 @@ When releasing multiple workspace crates in one session:
 | `-p <crate>` | Scope all commands to that workspace member. |
 | Explicit version (e.g. "release 2.1.0") | Use as the confirmed version in step 1; still require user confirmation before editing files. |
 
-There is **no** "skip smoke test", "skip clippy", or "skip GitHub release" path in a full release.
+There is **no** "skip smoke test", "skip clippy", "skip CI wait", or "skip GitHub release" path in a full release.
 
 ## Gotchas
 
 - **`cargo publish` publishes the local tree**, not necessarily what's on GitHub. Push commits before publishing if the remote should match.
+- **Green local checks are not a green matrix.** Step 3 runs on one host; step 5a is what covers the platforms the project actually claims to support. For ABI- or target-sensitive crates the difference is the whole point — don't collapse the two.
 - **Re-publishing the same version is impossible.** Confirm the target version carefully in step 1.
 - **Tag convention ≠ semver in Cargo.toml.** A repo may tag `1.2.3` while others use `v1.2.3` — always derive from existing tags.
 - **Feature flags / MSRV:** smoke test with default features; if the crate is heavily feature-gated, also run smoke tests with `--all-features`.
