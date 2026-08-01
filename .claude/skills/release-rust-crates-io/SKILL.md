@@ -169,21 +169,37 @@ SHA=$(git rev-parse HEAD)
 gh run list --commit "$SHA" --limit 100 --json databaseId,name,status,conclusion
 ```
 
-`gh run watch <run-id> --exit-status` turns a failed run into a non-zero exit, but it has no deadline of its own — wrap it in `timeout 1200` if you watch runs individually. To wait on the whole set:
+`gh run watch <run-id> --exit-status` turns a failed run into a non-zero exit, but it has no deadline of its own — wrap it in `timeout 1200` if you watch runs individually.
+
+**An all-completed snapshot is not sufficient on its own.** Workflows triggered by the push you just made take time to register, so `gh run list` can lag behind reality. If the commit already carries a completed run from an earlier push, the very first poll may show "everything finished, one success" while the tag-triggered matrix is still queuing — passing the gate on evidence that predates the release. So require the run set to have **stopped changing** before accepting it:
 
 ```bash
 SHA=$(git rev-parse HEAD)
-DEADLINE=$(( $(date +%s) + 1200 ))          # 20 minutes
+DEADLINE=$(( $(date +%s) + 1200 ))          # 20 minutes overall
+SETTLE=60                                   # run set must be unchanged this long
+PREV_IDS=""; STABLE_SINCE=0
 
 while :; do
   RUNS=$(gh run list --commit "$SHA" --limit 100 \
            --json databaseId,name,status,conclusion) \
     || { echo "gh run list failed — stopping, NOT publishing"; exit 1; }
 
-  [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")" -eq 0 ] && break
+  IDS=$(jq -r '[.[].databaseId] | sort | join(",")' <<<"$RUNS")
+  PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")
+  NOW=$(date +%s)
 
-  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-    echo "CI still running after 20 min. Outstanding:"
+  # A run appearing (or the first look) restarts the settle timer.
+  if [ "$IDS" != "$PREV_IDS" ]; then
+    PREV_IDS="$IDS"; STABLE_SINCE=$NOW
+  fi
+
+  # Accept only a set that is fully completed AND has stopped growing.
+  if [ "$PENDING" -eq 0 ] && [ $(( NOW - STABLE_SINCE )) -ge "$SETTLE" ]; then
+    break
+  fi
+
+  if [ "$NOW" -ge "$DEADLINE" ]; then
+    echo "CI not settled after 20 min. Outstanding:"
     jq -r '.[] | select(.status != "completed")
            | "  \(.databaseId)  \(.name)  \(.status)"' <<<"$RUNS"
     exit 1                                   # ask the user; do not publish
@@ -202,7 +218,9 @@ BAD=$(jq '[.[] | select(.conclusion
 [ "$OK"  -gt 0 ] || { echo "no successful run for $SHA — NOT publishing"; exit 1; }
 ```
 
-Three failure modes here look exactly like success if you don't check for them:
+Because the first observation seeds `STABLE_SINCE`, the loop always polls at least twice — a snapshot taken before the new workflows registered can never satisfy the gate by itself. Raise `SETTLE` on repos where workflows are slow to queue.
+
+Four failure modes here look exactly like success if you don't check for them:
 
 - **`gh` itself failing** (network, auth, rate limit) prints nothing on stdout, so a naive emptiness test reads it as "nothing pending." Check the exit status.
 - **Zero runs for the commit** ends the wait instantly with an empty verdict list. The `OK > 0` assertion is what stops an empty set from passing the gate.
@@ -227,7 +245,15 @@ So before running `cargo publish`, re-check that nothing moved underneath you �
 git rev-parse HEAD "<proposed-tag>^{commit}"   # must match each other and the confirmed commit
 ```
 
-If any of them has changed — a new commit landed, the tag was re-pointed, CI went green on a different SHA — **stop and re-confirm with the user.** Publishing a tree the user never approved is exactly the mistake that cannot be undone.
+If any has changed — a new commit landed, the tag was re-pointed, CI went green on a different SHA — **stop and re-confirm with the user.** Publishing a tree the user never approved is exactly the mistake that cannot be undone.
+
+**Matching revisions are not enough: `cargo publish` packages the working tree, not the commit.** If step 0 proceeded on a dirty tree, or anything changed on disk during the CI wait, `HEAD` and the tag can both still be correct while the tarball uploaded to crates.io differs from what CI validated. Require the tree to be clean:
+
+```bash
+git status --porcelain   # must print nothing
+```
+
+If it prints anything, **stop.** Commit the change and restart from step 3 so the checks and CI run against what will actually ship — or stash it if it doesn't belong in the release. Never reach for `--allow-dirty` to get past this: it is precisely the flag that decouples the published artifact from the reviewed, tested, tagged commit.
 
 Verify credentials (token in `~/.cargo/credentials.json` — do not print it). Re-run dry-run, then publish:
 
