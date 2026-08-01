@@ -162,37 +162,72 @@ git push origin HEAD
 
 Step 3 only ever exercises **one** host — one OS, one architecture, one toolchain. A crate whose behavior depends on target ABI, pointer width, endianness, or OS APIs can pass every local check and still be broken on a platform the project supports. `cargo publish` is irreversible: a version can be yanked, never replaced. So gate the publish on the project's own CI, run against the exact commit being released.
 
-Find the runs for the release commit:
+Resolve the SHA **once** — re-evaluating it inside the loop would silently retarget the gate if anything moved `HEAD` — and pass an explicit `--limit` above the number of workflows one commit can start (`gh run list` defaults to 20, so a busy repo can hide the very run still pending):
 
 ```bash
-gh run list --commit "$(git rev-parse HEAD)" --json databaseId,name,status,conclusion
+SHA=$(git rev-parse HEAD)
+gh run list --commit "$SHA" --limit 100 --json databaseId,name,status,conclusion
 ```
 
-Then either watch each run (`--exit-status` makes a failed run a non-zero exit):
+`gh run watch <run-id> --exit-status` turns a failed run into a non-zero exit, but it has no deadline of its own — wrap it in `timeout 1200` if you watch runs individually. To wait on the whole set:
 
 ```bash
-gh run watch <run-id> --exit-status
+SHA=$(git rev-parse HEAD)
+DEADLINE=$(( $(date +%s) + 1200 ))          # 20 minutes
+
+while :; do
+  RUNS=$(gh run list --commit "$SHA" --limit 100 \
+           --json databaseId,name,status,conclusion) \
+    || { echo "gh run list failed — stopping, NOT publishing"; exit 1; }
+
+  [ "$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")" -eq 0 ] && break
+
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    echo "CI still running after 20 min. Outstanding:"
+    jq -r '.[] | select(.status != "completed")
+           | "  \(.databaseId)  \(.name)  \(.status)"' <<<"$RUNS"
+    exit 1                                   # ask the user; do not publish
+  fi
+  sleep 20
+done
+
+jq -r '.[] | "\(.name): \(.conclusion)"' <<<"$RUNS"
+
+OK=$( jq '[.[] | select(.conclusion == "success")] | length' <<<"$RUNS")
+BAD=$(jq '[.[] | select(.conclusion
+          | IN("failure","cancelled","timed_out","startup_failure","action_required"))]
+          | length' <<<"$RUNS")
+
+[ "$BAD" -eq 0 ] || { echo "CI is not green — NOT publishing"; exit 1; }
+[ "$OK"  -gt 0 ] || { echo "no successful run for $SHA — NOT publishing"; exit 1; }
 ```
 
-or poll until every run on the commit has finished, then print the verdicts:
+Three failure modes here look exactly like success if you don't check for them:
 
-```bash
-until [ -z "$(gh run list --commit "$(git rev-parse HEAD)" \
-    --json status --jq '.[] | select(.status != "completed")')" ]; do sleep 20; done
-gh run list --commit "$(git rev-parse HEAD)" --json name,conclusion \
-  --jq '.[] | "\(.name): \(.conclusion)"'
-```
+- **`gh` itself failing** (network, auth, rate limit) prints nothing on stdout, so a naive emptiness test reads it as "nothing pending." Check the exit status.
+- **Zero runs for the commit** ends the wait instantly with an empty verdict list. The `OK > 0` assertion is what stops an empty set from passing the gate.
+- **A truncated listing** silently drops runs beyond the default limit.
 
 Gate on the outcome:
 
-- **Every run `success`** → proceed to step 6.
-- **Any run `failure` / `cancelled` / `timed_out`** → **stop, do not publish.** Report which job failed. The tag is already pushed; fix forward with a new version rather than trying to reuse this one.
-- **No CI configured**, or no runs exist for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
-- **Still running after ~20 min** → report what's outstanding and ask. Don't block forever, and don't publish on a pending matrix.
+- **Every run `success`** (`BAD == 0`, `OK > 0`) → proceed to step 6.
+- **Any `failure` / `cancelled` / `timed_out`** → **stop, do not publish.** Report which job failed. The tag is already pushed; fix forward with a new version rather than reusing this one.
+- **No CI configured**, or no runs for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
+- **Still running at the deadline** → report the outstanding run IDs and ask.
 
-If required checks only run on pull requests and the release commit landed directly on the default branch, there may be no runs for that SHA. Fall back to the checks on the PR that introduced it, or to explicit user confirmation — and note the gap in the final report.
+If required checks only run on pull requests and the release commit landed directly on the default branch, there may be no runs for that SHA. **Do not substitute the introducing PR's checks as evidence.** Squash and rebase merges produce a different commit than the one CI ran on, so those results describe a tree you are not publishing. Stop, and proceed only on explicit user approval recorded as a documented exception in the final report. PR checks may be cited as context — never as the gate.
 
 ## 6. Publish to crates.io
+
+**What authorizes this irreversible step:** the step-4 confirmation covers publishing **that exact tag and commit**, and only once step 5a is green. It is not open-ended approval to publish whatever is on disk now.
+
+So before running `cargo publish`, re-check that nothing moved underneath you — `HEAD` still at the confirmed commit, the tag still pointing there, the green CI runs belonging to that same SHA, and `Cargo.toml` still holding the confirmed version:
+
+```bash
+git rev-parse HEAD "<proposed-tag>^{commit}"   # must match each other and the confirmed commit
+```
+
+If any of them has changed — a new commit landed, the tag was re-pointed, CI went green on a different SHA — **stop and re-confirm with the user.** Publishing a tree the user never approved is exactly the mistake that cannot be undone.
 
 Verify credentials (token in `~/.cargo/credentials.json` — do not print it). Re-run dry-run, then publish:
 
