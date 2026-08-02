@@ -174,8 +174,10 @@ gh run list --commit "$SHA" --limit 100 --json databaseId,name,status,conclusion
 **Name the gate before waiting on it.** "At least one successful run" is not evidence the release was tested: a docs or release-automation workflow succeeding on the SHA satisfies it just as well as the test matrix, and a matrix that is PR-only or tag-filtered may never run on this commit at all. So establish *which* workflows constitute the gate, once, and require each of them by name:
 
 ```bash
-gh workflow list --json name,state --jq '.[] | select(.state == "ACTIVE") | .name'
+gh workflow list --json name --jq '.[].name'
 ```
+
+(`gh workflow list` already omits disabled workflows, so don't add a `state` filter. If you write one anyway, note the API reports `active` in lowercase — an `"ACTIVE"` comparison silently matches nothing, which would leave `REQUIRED` empty and quietly degrade this gate back to "any green run".)
 
 Confirm with the user which of those must be green for a release — typically the test matrix and any lint/MSRV job, not docs or publish automation. Record that as `REQUIRED` (one name per line). If the repo's branch protection already encodes this, prefer it as the source of truth, but note that its contexts are *job* names while `gh run list` reports *workflow* names, so they may need mapping:
 
@@ -302,6 +304,24 @@ git status --porcelain   # must print nothing
 ```
 
 If it prints anything, **stop.** Commit the change and restart from step 3 so the checks and CI run against what will actually ship — or stash it if it doesn't belong in the release. Never reach for `--allow-dirty` to get past this: it is precisely the flag that decouples the published artifact from the reviewed, tested, tagged commit.
+
+**A clean `git status` is still not proof the tarball matches the tag.** Cargo ships whatever its `include` / `exclude` rules select, which can include files git ignores or has never tracked — and `git status` says nothing about those. So verify the file set Cargo will actually upload:
+
+```bash
+UNVERIFIED=""
+while IFS= read -r f; do
+  # Cargo synthesises these two; they have no counterpart in the repo.
+  case "$f" in Cargo.toml.orig|.cargo_vcs_info.json) continue ;; esac
+  git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
+    || { echo "shipped but untracked (CI never saw it): $f"; UNVERIFIED=1; }
+  git diff --quiet "<proposed-tag>" -- "$f" 2>/dev/null \
+    || { echo "shipped but differs from the tag:        $f"; UNVERIFIED=1; }
+done < <(cargo package --list --quiet)
+
+[ -z "$UNVERIFIED" ] || { echo "package contents do not match the tagged commit — NOT publishing"; exit 1; }
+```
+
+Every file in the upload must be tracked and identical to the tag. An untracked file that Cargo packages is the sharpest version of this failure: CI never ran against it, review never saw it, and it ships anyway. Tighten `exclude` (or `include`) until the list contains only what you mean to publish — `cargo package --list` is the authority on that, not `.gitignore`.
 
 Verify credentials (token in `~/.cargo/credentials.json` — do not print it). Re-run dry-run, then publish:
 
