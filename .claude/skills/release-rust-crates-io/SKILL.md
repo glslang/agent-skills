@@ -307,21 +307,49 @@ If it prints anything, **stop.** Commit the change and restart from step 3 so th
 
 **A clean `git status` is still not proof the tarball matches the tag.** Cargo ships whatever its `include` / `exclude` rules select, which can include files git ignores or has never tracked — and `git status` says nothing about those. So verify the file set Cargo will actually upload:
 
+Scope the listing to **the same package `cargo publish` will upload**, and resolve its paths against that package's own directory — `--list` prints paths relative to the member's manifest, while `git` would otherwise interpret them from the repository root:
+
 ```bash
+CRATE="<crate-name>"                       # the same -p you will publish
+
+PKG_DIR=$(cargo metadata --no-deps --format-version 1 \
+  | jq -r --arg n "$CRATE" '
+      .packages[] | select(.name == $n) | .manifest_path | sub("/Cargo\\.toml$"; "")')
+[ -n "$PKG_DIR" ] || { echo "cannot locate package $CRATE — NOT publishing"; exit 1; }
+
+# `cargo package --list` errors (and prints nothing) on a dirty tree, so an
+# unchecked loop would sail past on an empty list. Demand real output.
+LIST=$(cargo package -p "$CRATE" --list --quiet) \
+  || { echo "cargo package --list failed — NOT publishing"; exit 1; }
+[ -n "$LIST" ] || { echo "empty package listing — NOT publishing"; exit 1; }
+
 UNVERIFIED=""
 while IFS= read -r f; do
-  # Cargo synthesises these two; they have no counterpart in the repo.
-  case "$f" in Cargo.toml.orig|.cargo_vcs_info.json) continue ;; esac
-  git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
+  case "$f" in
+    # Always synthesised by Cargo; no counterpart exists in the repo.
+    Cargo.toml.orig|.cargo_vcs_info.json) continue ;;
+    # Cargo generates a lockfile for crates that don't track one. Skip it only
+    # in that case — a tracked Cargo.lock still has to match the tag.
+    Cargo.lock)
+      git -C "$PKG_DIR" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || continue ;;
+  esac
+
+  git -C "$PKG_DIR" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
     || { echo "shipped but untracked (CI never saw it): $f"; UNVERIFIED=1; }
-  git diff --quiet "<proposed-tag>" -- "$f" 2>/dev/null \
+  git -C "$PKG_DIR" diff --quiet "<proposed-tag>" -- "$f" 2>/dev/null \
     || { echo "shipped but differs from the tag:        $f"; UNVERIFIED=1; }
-done < <(cargo package --list --quiet)
+done <<<"$LIST"
 
 [ -z "$UNVERIFIED" ] || { echo "package contents do not match the tagged commit — NOT publishing"; exit 1; }
 ```
 
 Every file in the upload must be tracked and identical to the tag. An untracked file that Cargo packages is the sharpest version of this failure: CI never ran against it, review never saw it, and it ships anyway. Tighten `exclude` (or `include`) until the list contains only what you mean to publish — `cargo package --list` is the authority on that, not `.gitignore`.
+
+Three ways this check can lie to you, all worth guarding:
+
+- **Wrong package.** An unscoped `cargo package --list` in a workspace inspects the root package while `cargo publish -p <member>` uploads a different one — verifying an archive you aren't shipping. Use the same selection in both.
+- **Wrong path root.** In a virtual workspace the listed paths are relative to the member, so repo-root `git` calls either miss files or reject valid ones. `git -C "$PKG_DIR"` keeps the two in the same frame.
+- **No data at all.** A failed or empty listing makes the loop body never execute, and an all-clear is indistinguishable from a real pass. Check the exit status and require non-empty output.
 
 Verify credentials (token in `~/.cargo/credentials.json` — do not print it). Re-run dry-run, then publish:
 
