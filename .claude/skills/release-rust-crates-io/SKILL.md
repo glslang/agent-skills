@@ -277,7 +277,9 @@ Six failure modes here look exactly like success if you don't check for them:
 
 Gate on the outcome:
 
-- **Every `REQUIRED` workflow present and `success`**, every other run `success` or `skipped` (`MISSING` and `UNPROVEN` empty, `BAD == 0`, `OK > 0`) → proceed to step 6. Note a required workflow concluding `skipped` fails `UNPROVEN`: tolerating a skip elsewhere is fine, accepting one as proof is not.
+- **Every `REQUIRED` workflow with at least one `success` on the SHA**, and no run concluding anything other than `success` or `skipped` (`MISSING` and `UNPROVEN` empty, `BAD == 0`, `OK > 0`) → proceed to step 6.
+
+  Precisely: a required workflow whose runs are *all* `skipped` fails `UNPROVEN` — a skip is never proof. But a workflow that succeeded once on this SHA stays proven even if a later duplicate run is skipped, because `--commit` pins the tree: a success on that SHA cannot be invalidated by a subsequent run declining to re-test the identical bytes. Requiring *every* execution to succeed would reject the ordinary case where a tag push re-triggers a path-filtered workflow that already passed on the branch push.
 - **A required workflow that never registered** → keep waiting, then stop at the deadline naming it. Absence is not evidence of success, and it is not the same as "nothing left to wait for".
 - **Any other conclusion** (`failure`, `cancelled`, `timed_out`, `startup_failure`, `action_required`, `stale`, `neutral`, …) → **stop, do not publish.** Report which job it was. The tag is already pushed; fix forward with a new version rather than reusing this one.
 - **No CI configured**, or no runs for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
@@ -323,6 +325,11 @@ LIST=$(cargo package -p "$CRATE" --list --quiet) \
   || { echo "cargo package --list failed — NOT publishing"; exit 1; }
 [ -n "$LIST" ] || { echo "empty package listing — NOT publishing"; exit 1; }
 
+# Submodule paths, longest first: the superproject tracks only the gitlink, so
+# a packaged file inside one is invisible to its `ls-files`.
+SUBS=$(git -C "$PKG_DIR" submodule status --recursive 2>/dev/null \
+       | awk '{print $2}' | awk '{print length, $0}' | sort -rn | cut -d" " -f2-)
+
 UNVERIFIED=""
 while IFS= read -r f; do
   case "$f" in
@@ -334,10 +341,28 @@ while IFS= read -r f; do
       git -C "$PKG_DIR" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || continue ;;
   esac
 
-  git -C "$PKG_DIR" ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
-    || { echo "shipped but untracked (CI never saw it): $f"; UNVERIFIED=1; }
-  git -C "$PKG_DIR" diff --quiet "<proposed-tag>" -- "$f" 2>/dev/null \
-    || { echo "shipped but differs from the tag:        $f"; UNVERIFIED=1; }
+  if git -C "$PKG_DIR" ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+    git -C "$PKG_DIR" diff --quiet "<proposed-tag>" -- "$f" 2>/dev/null \
+      || { echo "shipped but differs from the tag:        $f"; UNVERIFIED=1; }
+    continue
+  fi
+
+  # Not tracked by the superproject — it may still live in a submodule, whose
+  # contents are legitimately packaged and pinned by the tag's gitlink.
+  HANDLED=""
+  for sub in $SUBS; do
+    case "$f" in "$sub"/*) ;; *) continue ;; esac
+    rel=${f#"$sub"/}
+    git -C "$PKG_DIR/$sub" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || continue
+    PIN=$(git -C "$PKG_DIR" rev-parse "<proposed-tag>:$sub" 2>/dev/null)
+    [ -n "$PIN" ] || { echo "submodule not pinned by the tag:          $sub"; UNVERIFIED=1; HANDLED=1; break; }
+    git -C "$PKG_DIR/$sub" diff --quiet "$PIN" -- "$rel" 2>/dev/null \
+      || { echo "differs from the pinned submodule commit: $f"; UNVERIFIED=1; }
+    HANDLED=1; break
+  done
+  [ -n "$HANDLED" ] && continue
+
+  echo "shipped but untracked (CI never saw it): $f"; UNVERIFIED=1
 done <<<"$LIST"
 
 [ -z "$UNVERIFIED" ] || { echo "package contents do not match the tagged commit — NOT publishing"; exit 1; }
