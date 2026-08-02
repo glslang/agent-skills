@@ -169,7 +169,22 @@ SHA=$(git rev-parse HEAD)
 gh run list --commit "$SHA" --limit 100 --json databaseId,name,status,conclusion
 ```
 
-`gh run watch <run-id> --exit-status` turns a failed run into a non-zero exit, but it has no deadline of its own — wrap it in `timeout 1200` if you watch runs individually.
+`gh run watch <run-id> --exit-status` turns a failed run into a non-zero exit, but it has no deadline of its own, and the obvious wrapper isn't portable — macOS has no `timeout` unless coreutils is installed (it's `gtimeout` there). Prefer the poll loop below, which carries its own deadline and needs no external command. If you do watch runs individually, resolve the binary first rather than assuming: `TIMEOUT=$(command -v timeout || command -v gtimeout)`.
+
+**Name the gate before waiting on it.** "At least one successful run" is not evidence the release was tested: a docs or release-automation workflow succeeding on the SHA satisfies it just as well as the test matrix, and a matrix that is PR-only or tag-filtered may never run on this commit at all. So establish *which* workflows constitute the gate, once, and require each of them by name:
+
+```bash
+gh workflow list --json name,state --jq '.[] | select(.state == "ACTIVE") | .name'
+```
+
+Confirm with the user which of those must be green for a release — typically the test matrix and any lint/MSRV job, not docs or publish automation. Record that as `REQUIRED` (one name per line). If the repo's branch protection already encodes this, prefer it as the source of truth, but note that its contexts are *job* names while `gh run list` reports *workflow* names, so they may need mapping:
+
+```bash
+gh api "repos/<owner>/<repo>/branches/<base>/protection/required_status_checks" \
+  --jq '.contexts[]' 2>/dev/null
+```
+
+Requiring named workflows is also what makes the wait sound rather than merely patient: a required workflow that hasn't registered yet is *missing*, which keeps the loop waiting, instead of being invisible to a check that only asks whether the runs it can already see have finished.
 
 **An all-completed snapshot is not sufficient on its own.** Workflows triggered by the push you just made take time to register, so `gh run list` can lag behind reality. If the commit already carries a completed run from an earlier push, the very first poll may show "everything finished, one success" while the tag-triggered matrix is still queuing — passing the gate on evidence that predates the release. So require the run set to have **stopped changing** before accepting it:
 
@@ -193,6 +208,11 @@ while :; do
   PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")
   NOW=$(date +%s)
 
+  # Required workflows that have not even registered yet. Absence must keep us
+  # waiting — it is not the same as "nothing left to wait for".
+  MISSING=$(comm -23 <(sort -u <<<"$REQUIRED") \
+                     <(jq -r '.[].name' <<<"$RUNS" | sort -u))
+
   # First observation, or any run appearing/disappearing, restarts the settle
   # timer. The sentinel makes this fire on poll 1 even when the set is empty —
   # otherwise an empty first response would leave STABLE_SINCE at 0 and the
@@ -201,15 +221,18 @@ while :; do
     PREV_IDS="$IDS"; STABLE_SINCE=$NOW
   fi
 
-  # Accept only a set that is fully completed AND has stopped changing.
-  if [ "$PENDING" -eq 0 ] && [ $(( NOW - STABLE_SINCE )) -ge "$SETTLE" ]; then
+  # Accept only a set that has every required workflow present, is fully
+  # completed, and has stopped changing.
+  if [ -z "$MISSING" ] && [ "$PENDING" -eq 0 ] \
+     && [ $(( NOW - STABLE_SINCE )) -ge "$SETTLE" ]; then
     break
   fi
 
   if [ "$NOW" -ge "$DEADLINE" ]; then
-    echo "CI not settled after 20 min. Outstanding:"
+    echo "CI not settled after 20 min."
+    [ -n "$MISSING" ] && { echo "Never registered:"; sed 's/^/  /' <<<"$MISSING"; }
     jq -r '.[] | select(.status != "completed")
-           | "  \(.databaseId)  \(.name)  \(.status)"' <<<"$RUNS"
+           | "  still running: \(.databaseId)  \(.name)  \(.status)"' <<<"$RUNS"
     exit 1                                   # ask the user; do not publish
   fi
   sleep 20
@@ -228,11 +251,21 @@ BAD=$(jq '[.[] | select(.conclusion != "success" and .conclusion != "skipped")]
 
 [ "$BAD" -eq 0 ] || { echo "CI is not green — NOT publishing"; exit 1; }
 [ "$OK"  -gt 0 ] || { echo "no successful run for $SHA — NOT publishing"; exit 1; }
+
+# Every REQUIRED workflow must itself be green. Without this, a green docs or
+# release-automation run satisfies OK > 0 while the test matrix never ran.
+UNPROVEN=$(comm -23 <(sort -u <<<"$REQUIRED") \
+                    <(jq -r '.[] | select(.conclusion == "success") | .name' <<<"$RUNS" | sort -u))
+[ -z "$UNPROVEN" ] || {
+  echo "required workflows without a successful run on $SHA — NOT publishing:"
+  sed 's/^/  /' <<<"$UNPROVEN"; exit 1; }
 ```
 
 Because the sentinel guarantees the first observation seeds `STABLE_SINCE`, the loop always polls at least twice — including when that first response is empty, which is exactly when workflows are still registering. A snapshot taken before the new runs appeared can never satisfy the gate by itself. Raise `SETTLE` on repos where workflows are slow to queue.
 
-Five failure modes here look exactly like success if you don't check for them:
+Six failure modes here look exactly like success if you don't check for them:
+
+- **A green auxiliary workflow standing in for the test matrix.** Docs or release automation concluding `success` satisfies "at least one green run" perfectly well while the matrix was PR-only, tag-filtered, or simply never triggered on this SHA. Requiring workflows *by name* is the only thing that distinguishes "something passed" from "the tests passed".
 
 - **`gh` itself failing** (network, auth, rate limit) prints nothing on stdout, so a naive emptiness test reads it as "nothing pending." Check the exit status.
 - **Zero runs for the commit** ends the wait instantly with an empty verdict list. The `OK > 0` assertion is what stops an empty set from passing the gate.
@@ -242,7 +275,8 @@ Five failure modes here look exactly like success if you don't check for them:
 
 Gate on the outcome:
 
-- **Every run `success`** — or `skipped` — with at least one real `success` (`BAD == 0`, `OK > 0`) → proceed to step 6.
+- **Every `REQUIRED` workflow present and `success`**, every other run `success` or `skipped` (`MISSING` and `UNPROVEN` empty, `BAD == 0`, `OK > 0`) → proceed to step 6. Note a required workflow concluding `skipped` fails `UNPROVEN`: tolerating a skip elsewhere is fine, accepting one as proof is not.
+- **A required workflow that never registered** → keep waiting, then stop at the deadline naming it. Absence is not evidence of success, and it is not the same as "nothing left to wait for".
 - **Any other conclusion** (`failure`, `cancelled`, `timed_out`, `startup_failure`, `action_required`, `stale`, `neutral`, …) → **stop, do not publish.** Report which job it was. The tag is already pushed; fix forward with a new version rather than reusing this one.
 - **No CI configured**, or no runs for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
 - **Still running at the deadline** → report the outstanding run IDs and ask.
