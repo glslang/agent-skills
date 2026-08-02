@@ -177,23 +177,31 @@ gh run list --commit "$SHA" --limit 100 --json databaseId,name,status,conclusion
 SHA=$(git rev-parse HEAD)
 DEADLINE=$(( $(date +%s) + 1200 ))          # 20 minutes overall
 SETTLE=60                                   # run set must be unchanged this long
-PREV_IDS=""; STABLE_SINCE=0
+LIMIT=200                                   # must exceed runs-per-commit; asserted below
+PREV_IDS="__unset__"                        # sentinel: never equals a real ID set, even an empty one
+STABLE_SINCE=0
 
 while :; do
-  RUNS=$(gh run list --commit "$SHA" --limit 100 \
+  RUNS=$(gh run list --commit "$SHA" --limit "$LIMIT" \
            --json databaseId,name,status,conclusion) \
     || { echo "gh run list failed — stopping, NOT publishing"; exit 1; }
+
+  [ "$(jq 'length' <<<"$RUNS")" -lt "$LIMIT" ] \
+    || { echo "run list hit --limit $LIMIT and may be truncated — NOT publishing"; exit 1; }
 
   IDS=$(jq -r '[.[].databaseId] | sort | join(",")' <<<"$RUNS")
   PENDING=$(jq '[.[] | select(.status != "completed")] | length' <<<"$RUNS")
   NOW=$(date +%s)
 
-  # A run appearing (or the first look) restarts the settle timer.
+  # First observation, or any run appearing/disappearing, restarts the settle
+  # timer. The sentinel makes this fire on poll 1 even when the set is empty —
+  # otherwise an empty first response would leave STABLE_SINCE at 0 and the
+  # elapsed check would pass instantly against epoch time.
   if [ "$IDS" != "$PREV_IDS" ]; then
     PREV_IDS="$IDS"; STABLE_SINCE=$NOW
   fi
 
-  # Accept only a set that is fully completed AND has stopped growing.
+  # Accept only a set that is fully completed AND has stopped changing.
   if [ "$PENDING" -eq 0 ] && [ $(( NOW - STABLE_SINCE )) -ge "$SETTLE" ]; then
     break
   fi
@@ -209,27 +217,33 @@ done
 
 jq -r '.[] | "\(.name): \(.conclusion)"' <<<"$RUNS"
 
+# Allowlist, not denylist: any completed conclusion other than `success` or
+# `skipped` is non-green — that covers `failure`, `cancelled`, `timed_out`,
+# `startup_failure`, `action_required`, `stale`, `neutral`, and anything GitHub
+# adds later. `skipped` is tolerated (path-filtered workflows) but never counts
+# as evidence, because only `success` increments OK.
 OK=$( jq '[.[] | select(.conclusion == "success")] | length' <<<"$RUNS")
-BAD=$(jq '[.[] | select(.conclusion
-          | IN("failure","cancelled","timed_out","startup_failure","action_required"))]
+BAD=$(jq '[.[] | select(.conclusion != "success" and .conclusion != "skipped")]
           | length' <<<"$RUNS")
 
 [ "$BAD" -eq 0 ] || { echo "CI is not green — NOT publishing"; exit 1; }
 [ "$OK"  -gt 0 ] || { echo "no successful run for $SHA — NOT publishing"; exit 1; }
 ```
 
-Because the first observation seeds `STABLE_SINCE`, the loop always polls at least twice — a snapshot taken before the new workflows registered can never satisfy the gate by itself. Raise `SETTLE` on repos where workflows are slow to queue.
+Because the sentinel guarantees the first observation seeds `STABLE_SINCE`, the loop always polls at least twice — including when that first response is empty, which is exactly when workflows are still registering. A snapshot taken before the new runs appeared can never satisfy the gate by itself. Raise `SETTLE` on repos where workflows are slow to queue.
 
-Four failure modes here look exactly like success if you don't check for them:
+Five failure modes here look exactly like success if you don't check for them:
 
 - **`gh` itself failing** (network, auth, rate limit) prints nothing on stdout, so a naive emptiness test reads it as "nothing pending." Check the exit status.
 - **Zero runs for the commit** ends the wait instantly with an empty verdict list. The `OK > 0` assertion is what stops an empty set from passing the gate.
-- **A truncated listing** silently drops runs beyond the default limit.
+- **A truncated listing** silently drops runs — including, potentially, the one still pending. Asserting the result is shorter than `--limit` turns that into a stop rather than a false pass.
+- **An empty first response** would leave `STABLE_SINCE` at `0`, making the elapsed check pass instantly against epoch time. The `__unset__` sentinel is what forces the timer to start on poll 1.
+- **A non-failing, non-successful conclusion** — `stale`, `neutral`, `action_required` — is not a failure, so a denylist misses it while `OK > 0` is already satisfied by some other run. The allowlist is what makes these stop the release.
 
 Gate on the outcome:
 
-- **Every run `success`** (`BAD == 0`, `OK > 0`) → proceed to step 6.
-- **Any `failure` / `cancelled` / `timed_out`** → **stop, do not publish.** Report which job failed. The tag is already pushed; fix forward with a new version rather than reusing this one.
+- **Every run `success`** — or `skipped` — with at least one real `success` (`BAD == 0`, `OK > 0`) → proceed to step 6.
+- **Any other conclusion** (`failure`, `cancelled`, `timed_out`, `startup_failure`, `action_required`, `stale`, `neutral`, …) → **stop, do not publish.** Report which job it was. The tag is already pushed; fix forward with a new version rather than reusing this one.
 - **No CI configured**, or no runs for the commit → say so explicitly and ask whether to publish on local checks alone. Never silently treat "no CI" as "CI passed".
 - **Still running at the deadline** → report the outstanding run IDs and ask.
 
