@@ -65,11 +65,13 @@ Read the state: `gh pr view N --json mergeable,mergeStateStatus,headRefOid,baseR
 **`gh pr update-branch` and `update_pull_request_branch` act on GitHub, not on your checkout.** They create the merge commit on the remote head; your local branch still points at the old one. Commit fixes on top of that and §5's push is rejected as non-fast-forward — after a stale-looking diff that already cost you the debugging time. Always follow with:
 
 ```bash
-git fetch origin <headRefName>
-git merge --ff-only origin/<headRefName>   # fails loudly if you had local commits
+git fetch origin refs/pull/N/head          # works for same-repo and fork PRs alike
+git merge --ff-only FETCH_HEAD             # fails loudly if you had local commits
 ```
 
 Use `--ff-only` deliberately: if it refuses, you have unpushed local work and need to reconcile it, which is exactly the moment you want to notice.
+
+**Fetch `refs/pull/N/head`, not `origin/<headRefName>`.** On a fork PR the head branch does not exist in the base repo, so `git fetch origin <headRefName>` fails outright and leaves you on the stale commit this step exists to avoid. The base repo's `refs/pull/N/head` always resolves, for forks and same-repo branches both. Pushing is the asymmetric part: `refs/pull/N/head` is read-only, so a fork fix goes to the contributor's remote and only works if they enabled "allow edits from maintainers" — check before you start authoring one.
 
 **Force-pushing marks existing line comments "outdated" and collapses them** — which is why §2 runs first. After the rebase, re-check each collected thread against its new anchor: the line moved, the ask may still stand.
 
@@ -120,15 +122,20 @@ Plus `gh pr view N --json reviews,comments`.
 A PR is an issue as far as reactions go, so it's the issues endpoint:
 
 ```bash
-gh api repos/OWNER/REPO/issues/N/reactions --jq '.[] | {content, user: .user.login}'
+gh api --paginate "repos/OWNER/REPO/issues/N/reactions?content=+1" --jq '.[] | .user.login'
+gh api --paginate "repos/OWNER/REPO/issues/N/reactions?content=eyes" --jq '.[] | .user.login'
 ```
 
-**MCP:** `issue_read` (`method: "get"`) returns a `reactions` object on the PR — but only aggregate counts, no logins. Counts are enough to see *that* something reacted; use the REST endpoint above when you need to know it was the bot.
+Filter by `content` and paginate. The endpoint defaults to 30 per page and `gh api` does not follow pages without `--paginate`, so on a PR with many reactions the one you care about is quietly on page 2 — and a missed 👍 reads as "not reviewed yet", which is the exact wrong answer. The `content=` filter usually makes that moot, but pass both.
 
-Per-comment reactions are a different signal — read them for thread-level acks:
+**MCP: reactor identity is not available, so a reaction is never a sign-off on this path.** `issue_read` (`method: "get"`) returns aggregate counts only, and no MCP tool lists who reacted. Counts alone cannot separate a Codex sign-off from a passer-by's 👍, and guessing in either direction is a real failure: merge on a human's thumbs-up, or block forever waiting for one you already have.
+
+On the MCP-only path, treat bot sign-off as **unknown** and fall back to the evidence you do have — the findings-per-round trend and rounds-of-silence tests in §6. Say "bot state unverifiable on this path" in the report rather than implying either answer. If merge readiness genuinely hinges on it, ask the user to eyeball the reaction.
+
+Per-comment reactions are a different signal — read them for thread-level acks, with the same pagination caveat:
 
 ```bash
-gh api repos/OWNER/REPO/pulls/comments/<databaseId>/reactions --jq '.[] | {content, user: .user.login}'
+gh api --paginate repos/OWNER/REPO/pulls/comments/<databaseId>/reactions --jq '.[] | {content, user: .user.login}'
 ```
 
 The GraphQL query above takes `reactions(first:20){nodes{content user{login}}}` on each comment, but App bots can come back with a null `user` there — the REST endpoints report the bot login reliably, so prefer them when direction matters.
@@ -253,13 +260,18 @@ Two more stop signals, either one sufficient regardless of count:
 
 When you stop, say so in the thread — "addressed rounds 1–3; remaining items are nits, merging" — so the record shows a decision rather than an abandonment. And **batch hard**: with a bot on the PR, every extra push is not just another CI run, it's another six findings.
 
-**Bots fail in ways that look like silence.** Three seen in practice, none of which mean "no findings":
+**Bots fail in ways that look like silence** — none of these mean "no findings", but they don't all mean the same thing either. What matters is whether a pass is *coming*:
 
-- *"Review failed — the head commit changed during the review."* You pushed mid-review. The pass was discarded; it re-runs on the new head.
-- *"Review limit reached — next review available in N minutes."* Rate-limited. Nothing is coming until the window resets.
-- A review posted against an older commit than current `HEAD`. Its findings may already be fixed — check the `commit_id` on the review before acting.
+| State | Means | Do |
+|---|---|---|
+| 👀 on the PR body | A pass is running right now | **Wait.** Don't push into it — you'll discard the pass. |
+| *"Review failed — head commit changed"* | You pushed mid-review; pass discarded | Wait for the re-run on the new head. |
+| *"Review limit reached — next review in N minutes"* | Rate-limited | **Ignorable.** Proceed without it. |
+| Review posted against an older commit than `HEAD` | Findings may already be fixed | Check the review's `commit_id` before acting. |
 
-Never read any of these as an ack, and never treat one as a merge signal. If a bot has gone quiet, confirm *why* before §9 counts it as satisfied.
+**A rate-limited bot does not block merge readiness.** Nothing is coming inside the window, so "wait for it" means waiting out a quota rather than waiting for review — and on a busy account the quota can outlast the PR. Note it in the report ("CodeRabbit rate-limited, did not review") and let the human weigh it. Blocking on a bot that is structurally incapable of answering is its own flavor of the infinite loop this skill exists to prevent.
+
+The distinction is *pending* vs. *absent*. Pending (👀, discarded pass) → wait. Absent (rate-limited) → proceed and say so. Neither is ever an ack.
 
 CodeRabbit also pauses reviews on its own during rapid pushes ("reviews paused due to active development"). That is the bot agreeing with the batching advice; don't fight it with `@coderabbitai review` after every commit — on a rate-limited plan that spends a review you'll want later.
 
@@ -337,7 +349,7 @@ The PR is clear when **all** of these hold:
 
 - No `open` and no `escalated` rows. Every thread is `fixed`, `declined`, or `deferred:#issue` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7.
 - No outstanding `CHANGES_REQUESTED` review from a human. An approval that got dismissed by your push needs re-requesting, not ignoring.
-- Every bot reviewer has either signed off, gone two rounds silent, or hit the findings-trend stop signal with only nits outstanding. **Check the PR body's reactions for this** (§6) — a Codex 👍 there is an explicit sign-off, and a 👀 means a pass is still running.
+- Every bot reviewer has signed off, gone two rounds silent, hit the findings-trend stop signal with only nits outstanding, or is structurally absent (rate-limited — ignorable, per §6). **Check the PR body's reactions** (§6): a Codex 👍 there is an explicit sign-off, a 👀 means a pass is still running and you should wait. On the MCP-only path this is unverifiable — report it as unknown rather than assuming either way.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
 
 `mergeStateStatus: CLEAN` plus a Codex 👍 on the PR body is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done. Read the reaction before deciding anything is outstanding: it costs one call, and skipping it is how a cleared PR sits untouched waiting for a comment that is never coming.
