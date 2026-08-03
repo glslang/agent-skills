@@ -22,6 +22,8 @@ fi
 
 Confirm the target repo (`gh repo view` / current `git remote -v`). If the user wants a different repo than `cwd`, ask.
 
+**MCP path:** the repo must be in the session's scope first. In Claude Code on the web, a repo the session wasn't launched with returns `Access denied: repository … is not configured for this session` on every call — that's authorization, not a missing repo. Call `add_repo` (`access: "push"`) before step 1, and skip the clone it suggests unless you actually reach the local-fix path in 2f.
+
 ## 1. List Dependabot PRs, oldest first
 
 **gh:**
