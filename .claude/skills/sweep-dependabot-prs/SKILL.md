@@ -164,6 +164,7 @@ After the last repo, print one aggregate report:
 
 ## Gotchas
 
+- **On the MCP path, a repo must be in the session's scope before any call resolves.** In Claude Code on the web the session starts scoped to the repos it was launched with; every other repo returns `Access denied: repository … is not configured for this session` — an authorization error, *not* a missing repo. Discovery is the exception: `search_pull_requests` reaches everything the user can see, so a sweep reliably discovers repos it then cannot touch. Call `add_repo` (`access: "push"`) for each target before its first repo-scoped call, and do not let the denial convince you the repo is archived or gone. `add_repo` will tell you to clone; ignore that for a sweep — the happy path is API-only, and a clone costs minutes per repo for nothing.
 - **Search caps at 1000 results.** This is a GitHub search API limit, so it binds both paths. If `gh search prs` returns exactly 1000 — or `mcp__github__search_pull_requests` reports a `total_count` of 1000 — results were truncated: narrow the window, split by owner, or page with `created:` date ranges.
 - **The window filters on creation date, not last activity.** A 3-year-old PR Dependabot rebased yesterday is excluded by the default window. If the user says "old" or "stale" PRs are the point, suggest window "all".
 - **Search index lag.** A PR merged/closed seconds ago can still appear in search results. The per-repo `gh pr list` in step 3 is the source of truth; discovery is only for building the candidate list.
