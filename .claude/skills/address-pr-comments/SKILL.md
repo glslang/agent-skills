@@ -165,7 +165,7 @@ The GraphQL query above takes `reactions(first:20){nodes{content user{login}}}` 
 
 Filter to what's actually actionable:
 
-- Drop `isResolved: true`.
+- **Drop `isResolved: true` only when every comment id in the thread is already in the ledger.** Replying to a thread does not unresolve it — GitHub keeps `isResolved: true`, so a reviewer's fresh objection arrives inside a thread you closed. Filtering on the flag alone discards that ask here, in collection, before §8 ever gets the chance to reopen its row. Keep any thread holding an unseen comment id, resolved or not.
 - Drop comments authored by you — your own replies come back as events and are not new asks.
 - Keep `isOutdated: true` threads for now; the anchor is stale, the ask may not be. Check before dropping.
 
@@ -175,6 +175,8 @@ Keep a file in the scratchpad — `pr-<N>-feedback.md` — **one row per actiona
 
 | source | thread id | comment id | path:line | ask (one line) | rounds | last action | status |
 |---|---|---|---|---|---|---|---|
+
+Keep the `signoff: 👍 @ <SHA>` note here too (§6) — it's the only place a reaction's head binding can live, since the reaction itself carries none.
 
 `source` ∈ `thread` / `review-body` / `pr-comment`. The last two have no thread to resolve and no `isResolved` flag to filter on, so if they don't get a row they are tracked nowhere at all — and §9's "no open rows" then passes over an ask nobody ever answered. A blocking objection stated only in a `COMMENTED` review body is the classic case: it isn't `CHANGES_REQUESTED`, so no other check catches it either.
 
@@ -311,11 +313,15 @@ This is the easiest signal to miss, because a cleared PR and a never-reviewed PR
 
 What actually clears a bot is a **completed pass against the current head with no new findings**. Any of these establishes it:
 
-1. 👍 on the PR body — fastest, when it's there.
+1. 👍 on the PR body — fastest, but **it carries no SHA** (see below).
 2. A review whose `commit_id` equals current `HEAD` and which produced no line comments.
 3. Two consecutive rounds on the current diff with nothing new.
 
-Check `commit_id` against `HEAD` before crediting any of them: a clean pass on an older SHA says nothing about the code you just pushed.
+**A reaction has no commit id, so it cannot be head-qualified after the fact.** Signals 2 and 3 come from review objects and carry `commit_id`; a 👍 is just a 👍, and it persists unchanged across every later push. Credit it naively and the sequence is: Codex clears commit A, you push B, the same 👍 is still sitting there, and B merges having never been reviewed.
+
+Bind it to a head yourself. When you first observe the reaction, record it in the ledger as `signoff: 👍 @ <HEAD SHA at observation>`, and credit it **only while that SHA is still `HEAD`**. Any push invalidates it — sign-off resets to unknown until a fresh head-linked signal arrives. As corroboration, compare the reaction's `created_at` against the head commit's timestamp: a 👍 older than the commit it supposedly clears is stale on its face.
+
+The general shape: **every merge signal must be pinned to a SHA.** If a signal can't be, pin it at observation time and expire it on the next push.
 
 **Direction matters — check who reacted.** Codex ends every finding with *"Useful? React with 👍 / 👎"*, so a thumbs-up on a Codex *comment* is usually a human rating Codex, not Codex conceding. Same emoji, opposite meaning, different location. Body 👍 from the bot = signed off; comment 👍 from a human = feedback to the bot.
 
@@ -411,6 +417,7 @@ Anything still `open` — or `escalated` without a recorded decision — is unfi
 - **A merged PR is done, whatever its threads say.** Unresolved threads on a merged PR are history, not a backlog — the code shipped. If something in them still matters it becomes an issue (§7), never a push to a merged branch.
 - **Thread node id ≠ comment id.** `resolve_review_thread` needs `PRRT_…`; `add_reply_to_pull_request_comment` needs the numeric `#discussion_r…` id. Mixing them up produces a confusing "not found" — capture both in step 2.
 - **`gh pr view --comments` hides resolved state.** It will happily show you threads that were resolved two days ago. Use the GraphQL query.
+- **Resolving a thread doesn't stop it receiving replies, and a reply doesn't unresolve it.** A resolved thread with a new comment is the normal shape of a reviewer pushing back on your fix — filter on the flag alone and you'll never see it.
 - **Reactions are invisible unless you ask for them.** No `gh pr view` output includes them, and a reaction usually generates no webhook wake. A bot that signed off with 👍 an hour ago looks identical to one still waiting — which is how a finished PR sits untouched. Query the PR body's reactions (`issues/N/reactions`) plus each open thread's before concluding anything is outstanding.
 - **PR-level reactions live on the issues endpoint, not the pulls one.** `repos/O/R/pulls/N/reactions` does not exist; a PR reacts as an issue. Getting a 404 here reads as "no reactions" if you aren't watching, which turns a sign-off into silence.
 - **`gh pr update-branch` merges, it doesn't rebase.** It's the "Update branch" button. If the user asked for a rebase and linear history matters, do the rebase locally.
