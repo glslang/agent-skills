@@ -138,13 +138,17 @@ Plus `gh pr view N --json reviews,comments`.
 A PR is an issue as far as reactions go, so it's the issues endpoint:
 
 ```bash
-gh api --paginate repos/OWNER/REPO/issues/N/reactions -f content='+1'  --jq '.[] | .user.login'
-gh api --paginate repos/OWNER/REPO/issues/N/reactions -f content='eyes' --jq '.[] | .user.login'
+gh api --method GET --paginate "repos/OWNER/REPO/issues/N/reactions?content=%2B1"  --jq '.[] | .user.login'
+gh api --method GET --paginate "repos/OWNER/REPO/issues/N/reactions?content=eyes" --jq '.[] | .user.login'
 ```
 
-**Pass `content` as a field, not inline in the URL.** A raw `+` in a query string decodes to a space, so `?content=+1` sends `" 1"` and GitHub never sees the `+1` filter — silently returning the wrong set for the one check that decides whether the PR is clear. Use `-f content='+1'` (or `%2B1` if you must inline it).
+Three separate traps on this one line, and two of them fail silently:
 
-Paginate as well: the endpoint defaults to 30 per page and `gh api` won't follow pages without `--paginate`, so on a busy PR the reaction you want sits on page 2 and reads as "not reviewed yet".
+- **Encode the `+`.** A raw `+` in a query string decodes to a space, so `?content=+1` asks for `" 1"` and GitHub returns the unfiltered set. Use `%2B1`.
+- **Never reach for `-f content='+1'` to fix that.** `gh api` sends GET by default but switches to **POST as soon as any `-f`/`-F` parameter is present**, and POST on this endpoint *creates* a reaction. That command doesn't read the sign-off — it writes your own 👍 onto the PR body, which the very next readiness check then reads back as the bot clearing the PR. A wrong answer is recoverable; a fabricated sign-off that merges the PR is not. Pass `--method GET` explicitly whenever parameters are involved.
+- **Paginate.** 30 per page by default, and `gh api` won't follow pages without `--paginate`, so on a busy PR the reaction you want sits on page 2 and reads as "not reviewed yet".
+
+The general rule: **anything that reads a merge signal must be provably side-effect-free.** Check the HTTP method your tooling actually sent, not the one you meant.
 
 **MCP: reactor identity is not available, so a reaction is never a sign-off on this path.** `issue_read` (`method: "get"`) returns aggregate counts only, and no MCP tool lists who reacted. Counts alone cannot separate a Codex sign-off from a passer-by's 👍, and guessing in either direction is a real failure: merge on a human's thumbs-up, or block forever waiting for one you already have.
 
@@ -153,7 +157,8 @@ On the MCP-only path, treat bot sign-off as **unknown** and fall back to the evi
 Per-comment reactions are a different signal — read them for thread-level acks, with the same pagination caveat:
 
 ```bash
-gh api --paginate repos/OWNER/REPO/pulls/comments/<databaseId>/reactions --jq '.[] | {content, user: .user.login}'
+gh api --method GET --paginate repos/OWNER/REPO/pulls/comments/<databaseId>/reactions \
+  --jq '.[] | {content, user: .user.login}'
 ```
 
 The GraphQL query above takes `reactions(first:20){nodes{content user{login}}}` on each comment, but App bots can come back with a null `user` there — the REST endpoints report the bot login reliably, so prefer them when direction matters.
@@ -402,6 +407,7 @@ Anything still `open` — or `escalated` without a recorded decision — is unfi
 
 ## Gotchas
 
+- **Verify a fix didn't create a worse bug than the one it replaced.** A read that returns the wrong set is a bad day; the "fix" that turns it into a write which fabricates the signal you were reading is a merged PR nobody approved. When a correction changes *how* a call is made rather than what it asks for, re-check the method, the side effects, and the direction of the data — not just the parameter you set out to change.
 - **A merged PR is done, whatever its threads say.** Unresolved threads on a merged PR are history, not a backlog — the code shipped. If something in them still matters it becomes an issue (§7), never a push to a merged branch.
 - **Thread node id ≠ comment id.** `resolve_review_thread` needs `PRRT_…`; `add_reply_to_pull_request_comment` needs the numeric `#discussion_r…` id. Mixing them up produces a confusing "not found" — capture both in step 2.
 - **`gh pr view --comments` hides resolved state.** It will happily show you threads that were resolved two days ago. Use the GraphQL query.
