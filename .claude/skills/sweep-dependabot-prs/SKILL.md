@@ -14,10 +14,10 @@ Detect tooling the same way the base skill does: prefer `gh` if it's authenticat
 **Discovery works either way.** It relies on the search API, which both paths reach — `gh search prs` or `mcp__github__search_pull_requests`. In a restricted environment (Claude Code on the web, no `gh`), run the whole procedure over the MCP paths; the wrapper's per-repo steps below give MCP equivalents, and the inner loop already has them in the base skill.
 
 ```bash
-gh auth status && gh api user --jq .login   # capture LOGIN for defaults
+gh auth status && LOGIN=$(gh api user --jq .login)   # everything below keys off $LOGIN
 ```
 
-**MCP:** `mcp__github__get_me` → `.login`.
+**MCP:** `mcp__github__get_me`, and take its `.login` as `LOGIN`.
 
 Resolve the run parameters from the user's request:
 
@@ -74,13 +74,20 @@ gh search prs \
 
 **MCP:** `mcp__github__search_pull_requests` takes the same qualifiers in its `query` string — one call, not one per repo:
 
-```
+```text
 query:   "is:pr is:open author:app/dependabot user:<LOGIN> archived:false created:>=<CUTOFF>"
+page:    1
 perPage: 100, sort: created, order: asc
 fields:  ["number","title","state","draft","created_at","html_url","repository_url"]
 ```
 
-Drop the `created:` qualifier when the window is "all", and add an `org:<ORG>` variant per org when the user opted orgs in. Group the results by `repository_url` yourself to get the `{repo, prs, oldest}` shape the table below wants. The tool paginates — if `total_count` exceeds what you received, request further pages before building the table.
+Drop the `created:` qualifier when the window is "all", and add an `org:<ORG>` variant per org when the user opted orgs in.
+
+**Page before you group.** `perPage` caps at 100, so one call cannot hold a real fleet's queue. Keep incrementing `page` while the results you've accumulated are fewer than `total_count` (subject to the 1000-result cap in Gotchas). Grouping a first page as if it were the whole search silently truncates the sweep to ~100 PRs.
+
+**`repository_url` is an API URL, not a repo name** — `https://api.github.com/repos/glslang/agent-notify`, not `glslang/agent-notify`. Take its last two path segments as `owner/name` and key the grouping on that. Everything downstream — the union de-dup, `gh pr list -R "$REPO"`, `gh repo view`, `$DEST` — needs the canonical full name, so a raw URL used as `repo` breaks the per-repo loop.
+
+Group into the `{repo, prs, oldest}` shape the table below wants, where `oldest` is the minimum `created_at` in each group.
 
 ### List mode (user named repos)
 
@@ -165,7 +172,7 @@ After the last repo, print one aggregate report:
 ## Gotchas
 
 - **On the MCP path, a repo must be in the session's scope before any call resolves.** In Claude Code on the web the session starts scoped to the repos it was launched with; every other repo returns `Access denied: repository … is not configured for this session` — an authorization error, *not* a missing repo. Discovery is the exception: `search_pull_requests` reaches everything the user can see, so a sweep reliably discovers repos it then cannot touch. Call `add_repo` (`access: "push"`) for each target before its first repo-scoped call, and do not let the denial convince you the repo is archived or gone. `add_repo` will tell you to clone; ignore that for a sweep — the happy path is API-only, and a clone costs minutes per repo for nothing.
-- **Search caps at 1000 results.** This is a GitHub search API limit, so it binds both paths. If `gh search prs` returns exactly 1000 — or `mcp__github__search_pull_requests` reports a `total_count` of 1000 — results were truncated: narrow the window, split by owner, or page with `created:` date ranges.
+- **Search caps at 1000 retrievable results.** This is a GitHub search API limit, so it binds both paths, and it caps what you can *page to* — `total_count` will happily report more. Treat 1000 as *possible* truncation, not proof of it: a search with exactly 1000 matches is complete. If `gh search prs` returns 1000, or `mcp__github__search_pull_requests` reports a `total_count` of 1000 or more, assume you may be missing repos and narrow — shrink the window, split by owner, or walk `created:` date ranges.
 - **The window filters on creation date, not last activity.** A 3-year-old PR Dependabot rebased yesterday is excluded by the default window. If the user says "old" or "stale" PRs are the point, suggest window "all".
 - **Search index lag.** A PR merged/closed seconds ago can still appear in search results. The per-repo `gh pr list` in step 3 is the source of truth; discovery is only for building the candidate list.
 - **Forks:** Dependabot PRs on your fork usually target *your* default branch and are mergeable — but if the user's intent is upstream contributions, forks are noise. When discovery surfaces forks, flag them in the confirmation table rather than silently including them.
