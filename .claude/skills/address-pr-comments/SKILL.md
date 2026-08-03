@@ -319,9 +319,13 @@ What actually clears a bot is a **completed pass against the current head with n
 
 **A reaction has no commit id, so it cannot be head-qualified after the fact.** Signals 2 and 3 come from review objects and carry `commit_id`; a 👍 is just a 👍, and it persists unchanged across every later push. Credit it naively and the sequence is: Codex clears commit A, you push B, the same 👍 is still sitting there, and B merges having never been reviewed.
 
-Bind it to a head yourself. When you first observe the reaction, record it in the ledger as `signoff: 👍 @ <HEAD SHA at observation>`, and credit it **only while that SHA is still `HEAD`**. Any push invalidates it — sign-off resets to unknown until a fresh head-linked signal arrives. As corroboration, compare the reaction's `created_at` against the head commit's timestamp: a 👍 older than the commit it supposedly clears is stale on its face.
+Bind it to a head yourself — but **only a reaction you watched appear counts.** Record `signoff: 👍 @ <SHA>` when you observe the reaction *arrive* while `<SHA>` was already `HEAD`, and credit it only while that SHA is still `HEAD`. Any push invalidates it; sign-off resets to unknown until a fresh head-linked signal arrives.
 
-The general shape: **every merge signal must be pinned to a SHA.** If a signal can't be, pin it at observation time and expire it on the next push.
+**A 👍 that was already there when you first looked proves nothing.** Start a sweep on commit B with Codex's 👍 from commit A still sitting on the body, and pinning it at first observation records `👍 @ B` — clearing code that was never reviewed, on the strength of a reaction about something else. Treat a pre-existing reaction as unattributed and fall back to signals 2 and 3.
+
+Timestamps don't rescue this either: a pass against A can finish and react *after* B was committed, so `created_at > commit time` is consistent with both readings. A stale `created_at` can rule a reaction **out**, but a fresh one can never rule it **in**.
+
+The general shape: **every merge signal must be pinned to a SHA, by observation or by `commit_id`.** A signal you cannot pin either way is not a signal — say "unknown" and lean on the ones you can.
 
 **Direction matters — check who reacted.** Codex ends every finding with *"Useful? React with 👍 / 👎"*, so a thumbs-up on a Codex *comment* is usually a human rating Codex, not Codex conceding. Same emoji, opposite meaning, different location. Body 👍 from the bot = signed off; comment 👍 from a human = feedback to the bot.
 
