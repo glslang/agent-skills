@@ -11,11 +11,13 @@ Fleet-mode wrapper around [`merge-dependabot-prs`](../merge-dependabot-prs/SKILL
 
 Detect tooling the same way the base skill does: prefer `gh` if it's authenticated, otherwise fall back to the `mcp__github__*` tools.
 
-**Discovery needs `gh`** — it relies on the search API, and the MCP GitHub tools have no equivalent bulk search. In a restricted environment (Claude Code on the web, no `gh`), discovery is unavailable: ask the user for an explicit repo list, then run the whole procedure over the MCP paths — the wrapper's own per-repo steps below give MCP equivalents, and the inner loop already has them in the base skill.
+**Discovery works either way.** It relies on the search API, which both paths reach — `gh search prs` or `mcp__github__search_pull_requests`. In a restricted environment (Claude Code on the web, no `gh`), run the whole procedure over the MCP paths; the wrapper's per-repo steps below give MCP equivalents, and the inner loop already has them in the base skill.
 
 ```bash
 gh auth status && gh api user --jq .login   # capture LOGIN for defaults
 ```
+
+**MCP:** `mcp__github__get_me` → `.login`.
 
 Resolve the run parameters from the user's request:
 
@@ -69,6 +71,16 @@ gh search prs \
 ```
 
 `DISCOVERY_CREATED` is empty when the window is "all", so no date qualifier is sent.
+
+**MCP:** `mcp__github__search_pull_requests` takes the same qualifiers in its `query` string — one call, not one per repo:
+
+```
+query:   "is:pr is:open author:app/dependabot user:<LOGIN> archived:false created:>=<CUTOFF>"
+perPage: 100, sort: created, order: asc
+fields:  ["number","title","state","draft","created_at","html_url","repository_url"]
+```
+
+Drop the `created:` qualifier when the window is "all", and add an `org:<ORG>` variant per org when the user opted orgs in. Group the results by `repository_url` yourself to get the `{repo, prs, oldest}` shape the table below wants. The tool paginates — if `total_count` exceeds what you received, request further pages before building the table.
 
 ### List mode (user named repos)
 
@@ -152,7 +164,7 @@ After the last repo, print one aggregate report:
 
 ## Gotchas
 
-- **`gh search prs` caps at 1000 results.** If the search returns exactly 1000, results were truncated — narrow the window, split by `--owner`, or page with `--created` date ranges.
+- **Search caps at 1000 results.** This is a GitHub search API limit, so it binds both paths. If `gh search prs` returns exactly 1000 — or `mcp__github__search_pull_requests` reports a `total_count` of 1000 — results were truncated: narrow the window, split by owner, or page with `created:` date ranges.
 - **The window filters on creation date, not last activity.** A 3-year-old PR Dependabot rebased yesterday is excluded by the default window. If the user says "old" or "stale" PRs are the point, suggest window "all".
 - **Search index lag.** A PR merged/closed seconds ago can still appear in search results. The per-repo `gh pr list` in step 3 is the source of truth; discovery is only for building the candidate list.
 - **Forks:** Dependabot PRs on your fork usually target *your* default branch and are mergeable — but if the user's intent is upstream contributions, forks are noise. When discovery surfaces forks, flag them in the confirmation table rather than silently including them.
