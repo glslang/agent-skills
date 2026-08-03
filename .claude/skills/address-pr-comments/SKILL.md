@@ -108,6 +108,8 @@ Keep a file in the scratchpad — `pr-<N>-threads.md` — one row per thread. Th
 
 `status` ∈ `open` / `fixed` / `declined` / `deferred:#issue` / `escalated`. Update it as you go — it is the source of truth for the final report and for whether a returning comment is round 1 or round 3.
 
+Keep a second, much smaller tally at the top of the same file — one line per review round: `round N (commit abc123): 6 findings, 2 real bugs, 4 nits`. Per-thread rounds catch a reviewer repeating themselves; this catches a bot generating fresh findings on every push, which is a different loop and the more common one (§6).
+
 ## 3. Triage each thread
 
 Classify before touching code:
@@ -189,6 +191,26 @@ Never spend more than **two pushes** on a single thread. When you hit the cap, p
 
 Codex, Copilot, CodeRabbit and friends generate high volume and low signal. Verify them exactly as hard as a human, batch them into one pass, and be readier to decline. Never let a bot comment trigger a redesign.
 
+**Every push buys another full review pass.** This is the real infinite loop with bots, and it isn't the per-thread kind §6 opens with — each new commit triggers a fresh review that finds *new* things, so you can address six findings perfectly and immediately be handed six more. The thread ledger won't catch it, because no single thread repeats.
+
+Track **findings per round** alongside the per-thread rounds. Convergence looks like a falling count on a stable diff:
+
+| Round | Findings | Read |
+|---|---|---|
+| 1 → 2 | 6 → 6 | Fine if round 2's are genuinely new ground |
+| 2 → 3 | 6 → 3 | Converging — keep going |
+| 3 → 4 | 3 → 3 | Check severity: real bugs, or nits it didn't care about in round 1? |
+| any | count flat or rising across 3 rounds | **Stop pushing.** The bot is exploring, not converging. |
+
+Two more stop signals, either one sufficient regardless of count:
+
+- **Severity is trending down.** Round 1 found a data-loss bug; round 4 wants a doc comment reworded. The valuable passes are over — take the remaining nits or leave them, but stop cycling.
+- **New findings are in code the last round just touched.** The bot is reviewing your fixes, not the PR.
+
+When you stop, say so in the thread — "addressed rounds 1–3; remaining items are nits, merging" — so the record shows a decision rather than an abandonment. And **batch hard**: with a bot on the PR, every extra push is not just another CI run, it's another six findings.
+
+CodeRabbit pauses reviews on its own during rapid pushes ("reviews paused due to active development"). That is the bot agreeing with the batching advice; don't fight it with `@coderabbitai review` after every commit.
+
 **A 👍 reaction from the bot is its acknowledgement.** Codex reacts with a thumbs-up when it's satisfied — on the original comment once you've fixed it, or on your reply when you pushed back and it accepted the argument. Treat that as the thread closing:
 
 - Ack received → mark the thread `fixed` / `declined` in the ledger, resolve it, **stop working on it**. Re-litigating a point the bot already conceded is the exact ad-infinitum loop this skill exists to break.
@@ -248,7 +270,7 @@ Once every ledger row is terminal, say explicitly whether the PR is clear. It is
 
 - No `open` rows in the ledger — every thread is `fixed`, `declined`, `deferred:#issue`, or `escalated` with the escalation actually posted.
 - No outstanding `CHANGES_REQUESTED` review from a human. An approval that got dismissed by your push needs re-requesting, not ignoring.
-- Every bot reviewer has either acked (§6) or gone two rounds silent.
+- Every bot reviewer has either acked (§6), gone two rounds silent, or hit the findings-trend stop signal with only nits outstanding.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
 
 `mergeStateStatus: CLEAN` plus a Codex 👍 on the last open thread is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done.
