@@ -30,6 +30,17 @@ fi
 
 Resolve the target PR: an explicit `#N`, otherwise the PR for the current branch (`gh pr view --json number`). Confirm with the user if the branch has no PR or several.
 
+**Then put the checkout on that PR's head before touching anything.** When the user names a PR explicitly, the working tree is very often on `main` or on some other feature branch — and every local step from here (sync, edit, commit, push) would then operate on the wrong branch while replies and resolutions go to PR `N`. Wrong-branch commits are the most expensive mistake in this procedure and the least visible, because everything on GitHub still looks right.
+
+```bash
+gh pr checkout N                      # or: git fetch origin <headRefName> && git switch <headRefName>
+git status --porcelain                # must be clean; stash or stop if not
+gh pr view N --json headRefName,headRefOid --jq '.headRefName + " " + .headRefOid'
+git rev-parse HEAD                    # must equal headRefOid
+```
+
+If the head SHA doesn't match after checkout, stop and find out why (someone pushed, or you're on a stale fetch) rather than committing on top. On the MCP path with no local checkout, you have no local branch to get wrong — but you also cannot author fixes; restrict yourself to replies, resolutions, and issue filing.
+
 Then decide **mode**:
 
 - **Sweep** (default) — address everything outstanding right now, then report.
@@ -47,9 +58,18 @@ Read the state: `gh pr view N --json mergeable,mergeStateStatus,headRefOid,baseR
 
 | Situation | Do this |
 |---|---|
-| PR is under active review (unresolved threads exist) | **Merge base in.** `gh pr update-branch N` (**MCP:** `update_pull_request_branch`). No force-push, so line comments stay anchored. |
+| PR is under active review (unresolved threads exist) | **Merge base in.** `gh pr update-branch N` (**MCP:** `update_pull_request_branch`). No force-push, so line comments stay anchored. **Then fast-forward your checkout** — see below. |
 | Repo requires linear history, or user explicitly said "rebase" | `git fetch origin && git rebase origin/<base>` then `git push --force-with-lease`. |
 | `DIRTY` (real conflicts) | Resolve locally. Merge or rebase per the repo's convention — check `git log --merges origin/<base> -5`: no merge commits means the repo rebases or squashes. |
+
+**`gh pr update-branch` and `update_pull_request_branch` act on GitHub, not on your checkout.** They create the merge commit on the remote head; your local branch still points at the old one. Commit fixes on top of that and §5's push is rejected as non-fast-forward — after a stale-looking diff that already cost you the debugging time. Always follow with:
+
+```bash
+git fetch origin <headRefName>
+git merge --ff-only origin/<headRefName>   # fails loudly if you had local commits
+```
+
+Use `--ff-only` deliberately: if it refuses, you have unpushed local work and need to reconcile it, which is exactly the moment you want to notice.
 
 **Force-pushing marks existing line comments "outdated" and collapses them** — which is why §2 runs first. After the rebase, re-check each collected thread against its new anchor: the line moved, the ask may still stand.
 
@@ -93,13 +113,25 @@ Plus `gh pr view N --json reviews,comments`.
 
 **Capture two IDs per thread.** They are not interchangeable and you need both: the GraphQL node id (`PRRT_…`) to resolve the thread, and the first comment's numeric `databaseId` (the `#discussion_r…` number) to reply to it.
 
-**Read reactions too — some reviewers ack with an emoji instead of a reply.** Codex in particular thumbs-ups a comment when it considers the point settled, and that 👍 is the only signal you get; it never posts "looks good". A thread whose last event is a 👍 on your reply is **closed**, not awaiting another round.
+**Read reactions too — some reviewers ack with an emoji instead of a reply**, and there is no comment anywhere to tell you it happened.
+
+**The one that decides whether you're done sits on the PR body**, not on any review thread. Codex reacts on the initial comment: 👀 when a review pass starts, 👍 when the pass finds nothing. A PR whose body carries a Codex 👍 has been reviewed and cleared — that is the "merge is possible now" signal, and nothing else announces it.
+
+A PR is an issue as far as reactions go, so it's the issues endpoint:
+
+```bash
+gh api repos/OWNER/REPO/issues/N/reactions --jq '.[] | {content, user: .user.login}'
+```
+
+**MCP:** `issue_read` (`method: "get"`) returns a `reactions` object on the PR — but only aggregate counts, no logins. Counts are enough to see *that* something reacted; use the REST endpoint above when you need to know it was the bot.
+
+Per-comment reactions are a different signal — read them for thread-level acks:
 
 ```bash
 gh api repos/OWNER/REPO/pulls/comments/<databaseId>/reactions --jq '.[] | {content, user: .user.login}'
 ```
 
-The GraphQL query above takes `reactions(first:20){nodes{content user{login}}}` on each comment, but App bots can come back with a null `user` there — the REST endpoint reports the bot login reliably, so prefer it when you need to know *who* reacted.
+The GraphQL query above takes `reactions(first:20){nodes{content user{login}}}` on each comment, but App bots can come back with a null `user` there — the REST endpoints report the bot login reliably, so prefer them when direction matters.
 
 Filter to what's actually actionable:
 
@@ -109,10 +141,14 @@ Filter to what's actually actionable:
 
 ### Write a ledger
 
-Keep a file in the scratchpad — `pr-<N>-threads.md` — one row per thread. This survives context compaction, and §6's loop detection is impossible without it:
+Keep a file in the scratchpad — `pr-<N>-feedback.md` — **one row per actionable ask, from all three surfaces**, not one row per review thread. This survives context compaction, and §6's loop detection is impossible without it:
 
-| thread id | comment id | path:line | ask (one line) | rounds | last action | status |
-|---|---|---|---|---|---|---|
+| source | thread id | comment id | path:line | ask (one line) | rounds | last action | status |
+|---|---|---|---|---|---|---|---|
+
+`source` ∈ `thread` / `review-body` / `pr-comment`. The last two have no thread to resolve and no `isResolved` flag to filter on, so if they don't get a row they are tracked nowhere at all — and §9's "no open rows" then passes over an ask nobody ever answered. A blocking objection stated only in a `COMMENTED` review body is the classic case: it isn't `CHANGES_REQUESTED`, so no other check catches it either.
+
+Split a multi-part comment into one row per ask. A review body listing four problems is four rows; one row marked "addressed" hides the three you didn't do.
 
 `status` ∈ `open` / `fixed` / `declined` / `deferred:#issue` / `escalated`. Update it as you go — it is the source of truth for the final report and for whether a returning comment is round 1 or round 3.
 
@@ -227,17 +263,24 @@ Never read any of these as an ack, and never treat one as a merge signal. If a b
 
 CodeRabbit also pauses reviews on its own during rapid pushes ("reviews paused due to active development"). That is the bot agreeing with the batching advice; don't fight it with `@coderabbitai review` after every commit — on a rate-limited plan that spends a review you'll want later.
 
-**A 👍 reaction from the bot is its acknowledgement.** Codex states this in its own review boilerplate: *"If Codex has suggestions, it will comment; otherwise it will react with 👍."* So a review pass that produced a bare 👍 and no comments is a clean pass — the strongest merge signal the bot emits, and easy to mistake for "the bot hasn't run yet".
+**A 👍 on the PR body is the bot signing off on the whole PR.** Codex states the rule in its own review boilerplate — *"If Codex has suggestions, it will comment; otherwise it will react with 👍"* — and that reaction lands on the initial comment, not on any thread. Its two markers there:
 
-**Check who reacted before reading a 👍 as an ack.** Codex ends every finding with *"Useful? React with 👍 / 👎"* — so a thumbs-up sitting on a Codex comment is often *feedback to Codex*, from a human, not Codex conceding anything. Same emoji, opposite direction. The REST reactions endpoint gives you the reactor's login; use it rather than assuming.
+| Reaction on PR body | Means |
+|---|---|
+| 👀 | A review pass is running right now. Wait; don't push into it, or the pass gets discarded. |
+| 👍 | The pass found nothing. **This PR is reviewed and clear.** |
 
-Treat a genuine bot ack as the thread closing:
+This is the single most useful signal in the whole procedure and the easiest to miss, because a cleared PR and a never-reviewed PR look identical everywhere else — no comment, no check, no webhook wake. Query the PR body's reactions before concluding a bot is still pending.
+
+**Direction matters — check who reacted.** Codex ends every finding with *"Useful? React with 👍 / 👎"*, so a thumbs-up on a Codex *comment* is usually a human rating Codex, not Codex conceding. Same emoji, opposite meaning, different location. Body 👍 from the bot = signed off; comment 👍 from a human = feedback to the bot.
+
+Where a bot does ack a thread, treat that as the thread closing:
 
 - Ack received → mark the thread `fixed` / `declined` in the ledger, resolve it, **stop working on it**. Re-litigating a point the bot already conceded is the exact ad-infinitum loop this skill exists to break.
 - Ack on a decline is the bot agreeing you were right. Don't then make the change anyway.
 - No ack after two rounds → the bot has nothing more to add. Close it out yourself with a one-line note in the ledger and move on; a bot won't escalate, so there's no one to wait for.
 
-The 👍 also feeds merge readiness — see §9.
+The body 👍 feeds merge readiness directly — see §9.
 
 ## 7. When a comment becomes an issue
 
@@ -294,10 +337,10 @@ The PR is clear when **all** of these hold:
 
 - No `open` and no `escalated` rows. Every thread is `fixed`, `declined`, or `deferred:#issue` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7.
 - No outstanding `CHANGES_REQUESTED` review from a human. An approval that got dismissed by your push needs re-requesting, not ignoring.
-- Every bot reviewer has either acked (§6), gone two rounds silent, or hit the findings-trend stop signal with only nits outstanding.
+- Every bot reviewer has either signed off, gone two rounds silent, or hit the findings-trend stop signal with only nits outstanding. **Check the PR body's reactions for this** (§6) — a Codex 👍 there is an explicit sign-off, and a 👀 means a pass is still running.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
 
-`mergeStateStatus: CLEAN` plus a Codex 👍 on the last open thread is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done.
+`mergeStateStatus: CLEAN` plus a Codex 👍 on the PR body is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done. Read the reaction before deciding anything is outstanding: it costs one call, and skipping it is how a cleared PR sits untouched waiting for a comment that is never coming.
 
 **Merging is the user's call unless they delegated it.** If they said "merge it when the comments are cleared" or "get this in", merge (`gh pr merge` / `merge_pull_request`) using the repo's allowed method. Otherwise report ready-to-merge and stop — merging is irreversible and outward-facing. A delegation to merge is **not** a delegation to merge past an escalated row; that's the one case where you go back and ask.
 
@@ -319,12 +362,13 @@ Anything still `open` — or `escalated` without a recorded decision — is unfi
 
 - **Thread node id ≠ comment id.** `resolve_review_thread` needs `PRRT_…`; `add_reply_to_pull_request_comment` needs the numeric `#discussion_r…` id. Mixing them up produces a confusing "not found" — capture both in step 2.
 - **`gh pr view --comments` hides resolved state.** It will happily show you threads that were resolved two days ago. Use the GraphQL query.
-- **Reactions are invisible unless you ask for them.** No `gh pr view` output includes them, and a reaction usually generates no webhook wake. A bot that acked with 👍 an hour ago looks identical to one still waiting — which is how a finished PR sits untouched. Query reactions on every open thread before concluding anything is outstanding.
+- **Reactions are invisible unless you ask for them.** No `gh pr view` output includes them, and a reaction usually generates no webhook wake. A bot that signed off with 👍 an hour ago looks identical to one still waiting — which is how a finished PR sits untouched. Query the PR body's reactions (`issues/N/reactions`) plus each open thread's before concluding anything is outstanding.
+- **PR-level reactions live on the issues endpoint, not the pulls one.** `repos/O/R/pulls/N/reactions` does not exist; a PR reacts as an issue. Getting a 404 here reads as "no reactions" if you aren't watching, which turns a sign-off into silence.
 - **`gh pr update-branch` merges, it doesn't rebase.** It's the "Update branch" button. If the user asked for a rebase and linear history matters, do the rebase locally.
 - **Force-push collapses line comments as outdated.** Collect threads before rebasing, and expect the reviewer to lose their place — reply with what changed rather than assuming they can see it.
 - **Pushing dismisses approvals** in repos with "dismiss stale reviews on push". That's a cost of fixing things, not a reason to withhold a fix — but it is a reason to batch.
 - **A comment on an outdated line may still be live.** Read the ask, not the anchor.
-- **Review bodies carry asks too.** A `CHANGES_REQUESTED` review whose blocking objection lives only in the review body has no thread to resolve and is easy to miss entirely.
+- **Review bodies carry asks too.** A review whose blocking objection lives only in the body has no thread, no `isResolved` flag, and nothing to resolve — it exists only if you gave it a ledger row (§2). Answer it with a plain PR comment (`gh pr comment` / `add_issue_comment`), since there is no thread to reply into.
 - **Suggestion blocks commit as you.** Verify before applying; "the reviewer suggested it" is not a defense for a broken commit.
 - **Don't resolve a thread you declined** unless the reviewer agreed. Resolving your own dissent reads as steamrolling — leave it open for them to close.
 - **`@` mentions in replies notify people.** Reply on the thread; don't cc extra reviewers to win an argument.
