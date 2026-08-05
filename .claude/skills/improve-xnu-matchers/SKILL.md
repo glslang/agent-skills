@@ -104,6 +104,7 @@ Runs in under a second. Verdicts:
 |---|---|---|
 | `OK` | one referencing function, unshared, and the string lands in the register the rule claims | trust the rule |
 | `ARGBAD` | the string is materialised into a different argument register than `arg#` says | fix `arg#` to the register reported |
+| `ARGUNK` | `arg#` not proven here — the string is built in x4+ or in several registers across sites | check by hand; do not append on trust |
 | `SHARED` | the binary function also holds strings belonging to *other* source functions — something was inlined | re-check which function to name; the report lists who else landed there |
 | `MULTI` | string referenced from more than one function | ambiguous; pick deliberately or drop |
 | `NOREF` | string present but no ADRP+ADD/ADR reference found | may be reached another way; verify by hand |
@@ -116,7 +117,13 @@ that its `panic("DeviceTree overflow:")` ends up inside `_PE_init_platform`, so
 a rule naming `_SecureDTInit` could never fire.
 
 `ARGBAD` works because the compiler almost always builds the string directly in
-its argument register: `ADRP X2, … ; ADD X2, X2, #201` *is* `arg# = 2`. It has
+its argument register: `ADRP X2, … ; ADD X2, X2, #201` *is* `arg# = 2`. When it
+does not — the string goes into a callee-saved register like x23 and is moved
+into place later, or several sites in one function use different registers —
+`arg#` is simply not established, and that is `ARGUNK` rather than `OK`. Only an
+exact match between the observed register set and the declared `arg#` earns
+`OK`, because `--bare` emits `OK` rows for appending and an unproven row would
+land in the matchers file dressed as a verified one. It has
 already caught a real error — `IOCurrentTaskHasEntitlement` is `OS_ALWAYS_INLINE`
 and forwards to `IOTaskHasEntitlement(NULL, entitlement)`, so its string is at 1,
 not 0. Treat `CALLSITES` as a prior and this as the evidence.
@@ -163,7 +170,7 @@ Neither of these is required, and both have caveats worth knowing before spendin
 Worth knowing before trusting a verdict:
 
 - The ADRP page is tracked **per register in linear order**, not along control flow. Compilers emit ADRP+ADD adjacently in practice, but a pair split across basic blocks can be missed or mispaired. `NOREF` is the usual symptom.
-- `ARGBAD` reads the register the string is *built* in, not the one live at the call. A string built in x1 and moved to x2 before the call reads as arg 1. When a verdict looks wrong, disassemble the function and check — the `CALLSITES` prior and the shipped file are both evidence too.
+- The register check reads where the string is *built*, not what is live at the call. A string built in x1 and moved to x2 before the call reads as arg 1, and one built in a callee-saved register reads as `ARGUNK`. When a verdict looks wrong, disassemble the function and check — the `CALLSITES` prior and the shipped file are both evidence too.
 - `SHARED` is computed **only across the candidate set**. A binary function can hold inlined strings the scan never proposed, so `OK` means "nothing in this batch contradicts it", not "provably not inlined".
 - Function boundaries come from `LC_FUNCTION_STARTS`. If a kernel lacks it, this check cannot run at all — it exits rather than guessing.
 - Strings are read from `__cstring`, `__os_log`, and `__TEXT,__const`. A literal placed elsewhere reports `NOSTR` even though `strings` finds it.

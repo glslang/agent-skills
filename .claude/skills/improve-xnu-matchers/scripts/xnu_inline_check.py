@@ -33,7 +33,7 @@ import sys
 from array import array
 from collections import defaultdict
 
-VERIFY_PREFIX = re.compile(r"^(?:PRESENT|ABSENT|IMM|OK|ARGBAD|SHARED|MULTI|NOREF|NOSTR)\s*"
+VERIFY_PREFIX = re.compile(r"^(?:PRESENT|ABSENT|IMM|OK|ARGBAD|ARGUNK|SHARED|MULTI|NOREF|NOSTR)\s*"
                            r"(?:@ 0x[0-9a-f]+)?\s*\d*:?\s+(?=[0-3]\|)")
 
 MH_MAGIC_64 = 0xFEEDFACF
@@ -243,7 +243,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--matchers", required=True)
-    ap.add_argument("--only", help="comma-separated verdicts, e.g. OK or ARGBAD,SHARED,MULTI")
+    ap.add_argument("--only", help="comma-separated verdicts, e.g. OK or ARGBAD,ARGUNK,SHARED")
     ap.add_argument("--quiet", action="store_true", help="summary only")
     ap.add_argument("--bare", action="store_true",
                     help="print matcher lines only, no verdict column (for appending)")
@@ -305,11 +305,20 @@ def main():
             continue
         # The register the string is materialised into is the argument register
         # when the compiler builds it directly in place, which is the common
-        # case. x4+ means it goes somewhere else first and we cannot conclude.
+        # case. Anything else -- x4+ (it goes somewhere else first), or several
+        # registers across multiple sites -- means arg# is simply not proven
+        # here. That must not read as OK: bare mode emits OK rows for
+        # appending, so an unproven row would land in the matchers file dressed
+        # as a verified one.
         regs = r.get("regs") or []
-        if len(regs) == 1 and regs[0] <= 3 and regs[0] != r["arg"]:
+        if regs == [r["arg"]]:
+            continue
+        if len(regs) == 1 and regs[0] <= 3:
             r["verdict"] = "ARGBAD"
             r["saw_reg"] = regs[0]
+        else:
+            r["verdict"] = "ARGUNK"
+            r["saw_regs"] = regs
 
     want = set(args.only.split(",")) if args.only else None
     if args.bare and want is None:
@@ -333,14 +342,20 @@ def main():
         elif r["verdict"] == "ARGBAD":
             print(f"{'':>27}  ^ string is materialised into x{r['saw_reg']}, "
                   f"but the rule says arg {r['arg']}")
+        elif r["verdict"] == "ARGUNK":
+            seen = ", ".join(f"x{x}" for x in r["saw_regs"]) or "nothing"
+            print(f"{'':>27}  ^ arg {r['arg']} not proven here (materialised into "
+                  f"{seen}); check by hand before appending")
 
     total = len(rows)
     print(f"\n# {total} candidates: " + ", ".join(
-        f"{k}={counts[k]}" for k in ("OK", "ARGBAD", "SHARED", "MULTI", "NOREF", "NOSTR")
+        f"{k}={counts[k]}" for k in ("OK", "ARGBAD", "ARGUNK", "SHARED", "MULTI", "NOREF", "NOSTR")
         if counts[k]), file=sys.stderr)
     print("# OK = string referenced from exactly one function, unshared -> "
           "containing-function name is safe to trust", file=sys.stderr)
     print("# ARGBAD = string lands in a different argument register than the rule claims",
+          file=sys.stderr)
+    print("# ARGUNK = arg# not proven (built in x4+, or several registers) -- check by hand",
           file=sys.stderr)
     print("# SHARED/MULTI = inlined or ambiguous -> re-check which function to name",
           file=sys.stderr)
