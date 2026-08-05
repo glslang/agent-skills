@@ -209,8 +209,11 @@ def cstring_xrefs(data, execs, ranges, starts):
                 rd = insn & 0x1F
                 if in_ranges(target, ranges):
                     refs[target].append((pc, rd))
-                if rd != rn:
-                    pages.pop(rd, None)
+                # rd is clobbered either way. When rd == rn this is the usual
+                # ADRP xN / ADD xN, xN, #off pair: xN now holds the completed
+                # address, not the page base, so leaving it tracked lets a later
+                # ADD xN, xN, #imm fabricate an xref on the same page.
+                pages.pop(rd, None)
             elif (insn & 0x9F000000) == 0x10000000:        # ADR
                 immlo = (insn >> 29) & 0x3
                 immhi = (insn >> 5) & 0x7FFFF
