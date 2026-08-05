@@ -113,7 +113,8 @@ emitted. Where they differ, the reason is in the last column.
 | `snprintf` / `tsnprintf` | `_snprintf` | 2 | 2 | |
 | `scnprintf` | `_scnprintf` | 2 | 2 | |
 | `strlcpy` / `strlcat` / `strncpy` | as named | 1 | 1 | source operand |
-| `strcmp` / `strncmp` / `strlen` | as named | 0 | 0 | |
+| `strlen` | `_strlen` | 0 | 0 | |
+| `strcmp` / `strncmp` / `strcasecmp` | as named | any | same | literal sits on either side — see below |
 | `os_log*` | `_os_log_internal` | 1 | **3** | macro prepends dso + type |
 | `os_log_with_type` | `_os_log_internal` | 2 | **3** | macro prepends dso |
 | `OSKextLog` | `_OSKextLog` | 2 | 2 | |
@@ -130,6 +131,19 @@ emitted. Where they differ, the reason is in the last column.
 | `IOCurrentTaskHasEntitlement` | `_IOTaskHasEntitlement` | 0 | **1** | OS_ALWAYS_INLINE wrapper, NULL task prepended |
 | `IOCurrentTaskGetEntitlement` | `_IOTaskGetEntitlement` | 0 | **1** | same |
 | `mac_system_check_info` | same | 1 | 1 | |
+
+## Comparisons take the literal on either side
+
+`strcmp(name, "com.apple.foo")` is as common in XNU as
+`strcmp("com.apple.foo", name)`, and both are worth mining — identifier
+comparisons are exactly the stable strings this skill wants. These entries carry
+`src_idx = None` in `CALLSITES`, meaning "accept the literal wherever it is
+written, and emit it at that same index". Pinning them to 0 silently dropped the
+arg-1 form, which is the more common of the two in practice.
+
+Do **not** do this for `strlcpy`/`strlcat`/`strncpy`: their argument 0 is the
+destination buffer and can never be a literal, so a fixed `src_idx` of 1 is
+correct and a `None` would only admit noise.
 
 ## Highest-yield callees
 
