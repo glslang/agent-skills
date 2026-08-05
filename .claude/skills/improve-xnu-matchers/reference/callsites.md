@@ -1,0 +1,119 @@
+# Deriving `arg#`
+
+`arg#` is the register position (`x0`–`x3`) the string occupies in the call the
+compiler actually emits. To derive it for a callee that is not yet in
+`CALLSITES` in `scripts/xnu_scan.py`, work through these in order.
+
+## 1. Start from the real prototype
+
+Find the declaration, not the call. Count from zero.
+
+```c
+void OSKextLog(OSKext *aKext, OSKextLogSpec msgLogSpec, const char *format, ...);
+```
+
+`format` is index 2 → `2|...|...|_OSKextLog`. Matches the 14 `_OSKextLog` rules
+in the shipped file.
+
+## 2. Expand macros that prepend arguments
+
+`os_log` is the one that bites. In `libkern/os/log.h`:
+
+```c
+#define os_log(log, format, ...) \
+    os_log_with_type(log, OS_LOG_TYPE_DEFAULT, format, ##__VA_ARGS__)
+```
+
+which lowers to `_os_log_internal(&__dso_handle, log, type, format, ...)`. The
+format string is written second but emitted fourth → **`arg# = 3`**. Every
+`_os_log_internal` rule in the file is a 3.
+
+## 3. Follow thin wrappers that get inlined away
+
+A wrapper that is one call deep never survives as its own function; the emitted
+call is the *inner* one, with the inner one's argument order.
+
+`pexpert/gen/bootargs.c`:
+
+```c
+boolean_t
+PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg)
+{
+    return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
+}
+```
+
+`arg_string` is index 0 in the source call, index **1** in the emitted one. All
+the working `PE_parse_boot_argn` rules are 1. (`xnu.matchers:297` is a 0 — that
+one is inert. Left alone: rules are additive-only.)
+
+`osfmk/kern/thread.c`:
+
+```c
+void
+thread_set_thread_name(thread_t th, const char* name)
+{
+    if (th && name) {
+        bsd_setthreadname(get_bsdthread_info(th), thread_tid(th), name);
+    }
+}
+```
+
+`name` is index 1 in source, index **2** emitted.
+
+## 4. Sanity-check against the shipped file
+
+Before trusting a new entry, grep `xnu.matchers` for the callee. If a dozen
+existing rules disagree with your derivation, they are right and you are wrong —
+they were validated against real kernelcaches.
+
+```bash
+grep -E "^[0-3]\|" xnu.matchers | awk -F'|' '{print $1, $4}' | sort | uniq -c | sort -rn
+```
+
+## Verified table
+
+As encoded in `CALLSITES`. `src` is the index in the C source, `bin` the index
+emitted. Where they differ, the reason is in the last column.
+
+| Source callee | Emitted symbol | src | bin | Why they differ |
+|---|---|---|---|---|
+| `panic` | `_panic` | 0 | 0 | |
+| `panic_with_options` | `_panic_with_options` | 3 | 3 | |
+| `panic_with_thread_kernel_state` | same | 0 | 0 | |
+| `paniclog_append_noflush` | same | 0 | 0 | |
+| `printf` / `kprintf` / `IOLog` | `_printf` / `_kprintf` / `_IOLog` | 0 | 0 | |
+| `snprintf` / `tsnprintf` | `_snprintf` | 2 | 2 | |
+| `scnprintf` | `_scnprintf` | 2 | 2 | |
+| `strlcpy` / `strlcat` / `strncpy` | as named | 1 | 1 | source operand |
+| `strcmp` / `strncmp` / `strlen` | as named | 0 | 0 | |
+| `os_log*` | `_os_log_internal` | 1 | **3** | macro prepends dso + type |
+| `os_log_with_type` | `_os_log_internal` | 2 | **3** | macro prepends dso |
+| `OSKextLog` | `_OSKextLog` | 2 | 2 | |
+| `zone_create` | `_zone_create_ext` | 0 | 0 | trailing args added |
+| `zinit` | `_zinit` | 3 | 3 | |
+| `PE_parse_boot_argn` | `_PE_parse_boot_argn` | 0 | **1** | wrapper inlines to `_internal` |
+| `thread_set_thread_name` | `_thread_set_thread_name` | 1 | **2** | inlines to `bsd_setthreadname` |
+| `kern_coredump_log` | same | 1 | 1 | |
+| `tsleep`/`tsleep1`/`tsleep2` | as named | 2 | 2 | `wmesg` |
+| `msleep` family | as named | 3 | 3 | `wmesg` |
+| `lck_grp_init` | same | 1 | 1 | |
+| `SecureDTGetProperty` | same | 1 | 1 | property name |
+| `IOTaskHasEntitlement` | same | 1 | 1 | |
+| `IOCurrentTaskHasEntitlement` | same | 0 | 0 | |
+| `mac_system_check_info` | same | 1 | 1 | |
+
+## Highest-yield callees
+
+Format strings are plentiful but often shared between builds and edited between
+releases. Identifier-like strings are better matchers — they are unique, stable,
+and name the function almost by definition:
+
+- `zone_create` / `zinit` — the zone name is the subsystem name
+- `thread_set_thread_name` — names the thread's own entry function
+- `PE_parse_boot_argn` — boot-arg names are stable across releases
+- `IOTaskHasEntitlement` / `IOCurrentTaskHasEntitlement` — entitlement strings
+- `lck_grp_init` — lock group names
+- `SecureDTGetProperty` — device-tree property names
+
+`xnu_scan.py` scores these above format strings for this reason.
