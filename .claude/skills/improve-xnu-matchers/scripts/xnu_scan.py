@@ -54,8 +54,12 @@ CALLSITES = {
     "strlcpy":         ("_strlcpy",                          1, 1),
     "strlcat":         ("_strlcat",                          1, 1),
     "strncpy":         ("_strncpy",                          1, 1),
-    "strcmp":          ("_strcmp",                           0, 0),
-    "strncmp":         ("_strncmp",                          0, 0),
+    # Comparisons take the literal on either side -- strcmp(name, "com.apple.x")
+    # is as common as strcmp("com.apple.x", name). src_idx None means "any
+    # position, emitted where it was written".
+    "strcmp":          ("_strcmp",                        None, None),
+    "strncmp":         ("_strncmp",                       None, None),
+    "strcasecmp":      ("_strcasecmp",                    None, None),
     "strlen":          ("_strlen",                           0, 0),
     # os_log(log, fmt, ...) expands to
     # _os_log_internal(&__dso_handle, log, type, fmt, ...) -> fmt lands at 3.
@@ -418,9 +422,12 @@ def main():
                     continue
                 if entry:
                     sym, src_idx, bin_idx = entry
-                    if argidx != src_idx:
+                    if src_idx is None:
+                        emit_idx = argidx
+                    elif argidx != src_idx:
                         continue
-                    emit_idx = bin_idx
+                    else:
+                        emit_idx = bin_idx
                 else:
                     sym, emit_idx = "_" + callee, argidx
                 if emit_idx > 3:

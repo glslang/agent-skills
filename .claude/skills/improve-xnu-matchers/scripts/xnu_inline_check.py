@@ -163,14 +163,20 @@ def in_ranges(target, ranges):
     return False
 
 
-def cstring_xrefs(data, execs, ranges):
-    """Map every __cstring address in [lo, hi) to the code addresses that
-    materialise it via ADRP+ADD or ADR.
+def cstring_xrefs(data, execs, ranges, starts):
+    """Map every string address inside `ranges` to the (code address, register)
+    pairs that materialise it via ADRP+ADD or ADR.
 
     One pass over all executable sections. The ADRP page is tracked per
     destination register; the ADD that completes the pair usually follows
     within a few instructions, and a later ADRP to the same register
     supersedes the earlier one.
+
+    The tracked state is cleared at every function boundary. Registers do not
+    survive a call, so an ADRP at the tail of one function must never pair with
+    an ADD at the head of the next -- that would record an xref at a PC whose
+    function never materialises the string, and the containing-function and
+    argument-register verdicts are both derived from that PC.
     """
     refs = defaultdict(list)
     for addr, size, foff in execs:
@@ -179,8 +185,13 @@ def cstring_xrefs(data, execs, ranges):
         if sys.byteorder == "big":
             words.byteswap()
         pages = {}
+        nxt = bisect.bisect_right(starts, addr)
         for i, insn in enumerate(words):
             pc = addr + i * 4
+            if nxt < len(starts) and pc >= starts[nxt]:
+                pages.clear()
+                while nxt < len(starts) and pc >= starts[nxt]:
+                    nxt += 1
             if (insn & 0x9F000000) == 0x90000000:          # ADRP
                 immlo = (insn >> 29) & 0x3
                 immhi = (insn >> 5) & 0x7FFFF
@@ -242,7 +253,7 @@ def main():
     starts = function_starts(data, text_vmaddr, fstarts, execs)
     strings = list(cstrings(data, strsects))
     ranges = [(a, a + n) for a, n, _ in strsects]
-    refs = cstring_xrefs(data, execs, ranges)
+    refs = cstring_xrefs(data, execs, ranges, starts)
 
     print(f"# {len(starts)} functions, {len(strings)} cstrings, "
           f"{len(refs)} referenced cstrings", file=sys.stderr)
@@ -301,6 +312,11 @@ def main():
             r["saw_reg"] = regs[0]
 
     want = set(args.only.split(",")) if args.only else None
+    if args.bare and want is None:
+        # Bare output is meant to be appended to a matchers file. Emitting the
+        # rejected verdicts here would append exactly what the check just
+        # disqualified, so bare mode defaults to OK only.
+        want = {"OK"}
     counts = defaultdict(int)
     for r in rows:
         counts[r["verdict"]] += 1
