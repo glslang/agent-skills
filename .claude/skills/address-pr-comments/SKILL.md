@@ -100,7 +100,7 @@ Read the state: `gh pr view N --json mergeable,mergeStateStatus,headRefOid,baseR
 | Situation | Do this |
 |---|---|
 | PR is under active review (unresolved threads exist) | **Merge base in.** `gh pr update-branch N` (**MCP:** `update_pull_request_branch`). No force-push, so line comments stay anchored. **Then fast-forward your checkout** — see below. |
-| Repo requires linear history, or user explicitly said "rebase" | `git fetch origin && git rebase origin/<base>` then `git push --force-with-lease`. |
+| Repo requires linear history, or user explicitly said "rebase" | `git fetch origin && git rebase origin/<base>`, then force-push to §0's target with an explicit lease — see below. |
 | `DIRTY` (real conflicts) | Resolve locally. Merge or rebase per the repo's convention — check `git log --merges origin/<base> -5`: no merge commits means the repo rebases or squashes. |
 
 **`gh pr update-branch` and `update_pull_request_branch` act on GitHub, not on your checkout.** They create the merge commit on the remote head; your local branch still points at the old one. Commit fixes on top of that and §5's push is rejected as non-fast-forward — after a stale-looking diff that already cost you the debugging time. Always follow with:
@@ -111,6 +111,16 @@ git merge --ff-only FETCH_HEAD             # fails loudly if you had local commi
 ```
 
 Use `--ff-only` deliberately: if it refuses, you have unpushed local work and need to reconcile it, which is exactly the moment you want to notice.
+
+**A rebase publishes through §0's push target as well, and `--force-with-lease` needs the expectation spelled out.** Its bare form assumes an upstream *and* a remote-tracking ref for the target; a `pr-N` branch made from `refs/pull/N/head` has neither, so on that path a bare `git push --force-with-lease` dies with *"The current branch pr-N has no upstream branch"* — and merely adding the refspec then fails *"! [rejected] (stale info)"*, because there's no tracking ref to lease against. Name the expected value:
+
+```bash
+exp=$(git ls-remote "$remote" "refs/heads/$head_ref" | cut -f1)   # what you expect to overwrite
+git rebase origin/<base>
+git push --force-with-lease="refs/heads/$head_ref:$exp" "$remote" "HEAD:refs/heads/$head_ref"
+```
+
+Reaching for plain `--force` to make the "stale info" error go away is how you silently overwrite a commit someone else pushed while you were rebasing. The lease is the thing protecting you; give it what it needs instead of removing it.
 
 **Fetch `refs/pull/N/head`, not `origin/<headRefName>`.** On a fork PR the head branch does not exist in the base repo, so `git fetch origin <headRefName>` fails outright and leaves you on the stale commit this step exists to avoid. The base repo's `refs/pull/N/head` always resolves, for forks and same-repo branches both. Pushing is the asymmetric part — `refs/pull/N/head` is read-only, so fetch and push are different refs on a fork PR. §0's push-target table is the authority on where the push goes; it should already be settled by the time you get here.
 
@@ -169,7 +179,7 @@ gh pr view N --json reviews --jq '
 
 **MCP:** `pull_request_read` `method: "get_reviews"`, then the same fold by hand.
 
-Drop `COMMENTED` from the fold: GitHub doesn't treat it as a verdict, so a chatty follow-up review never clears a standing `CHANGES_REQUESTED` — count it as clearing and you'll walk past a live objection. `DISMISSED` and `APPROVED` do clear it. Two consumers depend on this table and nothing else: §9's "no outstanding `CHANGES_REQUESTED`" gate, and the "just the blocking ones" filter (§ Inputs).
+Drop `COMMENTED` from the fold: GitHub doesn't treat it as a verdict, so a chatty follow-up review never clears a standing `CHANGES_REQUESTED` — count it as clearing and you'll walk past a live objection. `APPROVED` clears it outright. `DISMISSED` clears the *block* but is not a sign-off — it means a verdict existed and was revoked, which §9 handles as its own state. Two consumers depend on this table and nothing else: §9's gate, and the "just the blocking ones" filter (§ Inputs).
 
 **MCP** — `pull_request_read` with `method: "get_review_comments"` (returns threads with `isResolved` / `isOutdated`), then `method: "get_reviews"`, then `method: "get_comments"`. Page with `perPage` + `after`.
 
@@ -451,7 +461,7 @@ Once every ledger row is terminal, say explicitly whether the PR is clear.
 The PR is clear when **all** of these hold:
 
 - No `open` and no `escalated` rows. Every row is `fixed`, `declined`, `deferred:#issue`, or `noted` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7. `noted` is legal only on an `advisory` row (§2); a judge's ask never leaves this gate unaddressed.
-- No **judge** whose **current** verdict (§2's fold, not the state on any individual comment) is `CHANGES_REQUESTED`. A reviewer who requested changes and has since approved is not blocking, and one who approved and has since requested changes is — read the fold both ways. An approval that got dismissed by your push needs re-requesting, not ignoring. An *advisory* `CHANGES_REQUESTED` doesn't block here either, by the same rule as everything else advisory; if the repo's branch protection blocks the merge on it regardless, that's a settings fact to report, not a thread to keep working.
+- No **judge** whose **current** verdict (§2's fold, not the state on any individual comment) is `CHANGES_REQUESTED` **or `DISMISSED`**. A reviewer who requested changes and has since approved is not blocking, and one who approved and has since requested changes is — read the fold both ways. `DISMISSED` is the third case and it is neither a block nor a pass: a verdict existed and was revoked, usually by your own push under "dismiss stale reviews", so the approval the repo was counting on is gone. Re-request that review and report the PR as not clear — "it isn't `CHANGES_REQUESTED`" is not the same as satisfied. A judge who only ever left `COMMENTED` is the genuinely different case: they never held a verdict to lose, so the next bullet's "satisfied, not necessarily approving" applies to them and not to a dismissal. An *advisory* `CHANGES_REQUESTED` doesn't block here either, by the same rule as everything else advisory; if the repo's branch protection blocks the merge on it regardless, that's a settings fact to report, not a thread to keep working.
 - **Every judge is satisfied** (§0). For a *human* judge that means their current verdict isn't `CHANGES_REQUESTED` — satisfied, not necessarily approving. Don't read "satisfied" as "must have approved": a code owner who commented and moved on has nothing outstanding, and waiting for an approval the repo's branch protection doesn't require is a stall of your own making. For a *bot* judge it means a completed pass against the current head with no new findings — by 👍, by an empty review on this SHA, or by two quiet rounds (§6). A 👀 means a pass is running: wait. A missing reaction means nothing on its own; don't gate on one. On the MCP-only path sign-off is unverifiable — report it as unknown rather than assuming either way.
 - **Advisory reviewers never block.** Their real findings still get fixed, but rate-limiting, silence, and unaddressed nits from an advisory reviewer are reported, not waited on. The mechanism is the `noted` status — an advisory nit you decided against is closed out, not left `open` for the first gate to trip over. "Never blocks" and "must not be `open`" are the same rule stated twice; if you find yourself waiting on an advisory row, the row is mis-statused.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
