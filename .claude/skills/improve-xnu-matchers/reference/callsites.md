@@ -61,6 +61,33 @@ thread_set_thread_name(thread_t th, const char* name)
 
 `name` is index 1 in source, index **2** emitted.
 
+## 3a. Wrapper inlining can be per-call-site
+
+`thread_set_thread_name` is the warning: at some call sites it inlines to
+`bsd_setthreadname` and the name lands at 2, at others it survives as a real
+call and the name stays at 1. The shipped file has **both** forms — four rules
+at 2 and two at 1 — and both are right, for different sites. Do not "fix" one to
+match the other.
+
+The table below is therefore a prior, not a guarantee. `xnu_inline_check.py`
+resolves it per site: its `ARGBAD` verdict reports the register the string is
+actually materialised into.
+
+That check found a genuine error in this table. `IOCurrentTaskHasEntitlement`
+was recorded as arg 0 from its own prototype, but in `IOKitBSDInit.cpp`:
+
+```c
+extern "C" OS_ALWAYS_INLINE boolean_t
+IOCurrentTaskHasEntitlement(const char *entitlement)
+{
+	return IOTaskHasEntitlement(NULL, entitlement);
+}
+```
+
+`OS_ALWAYS_INLINE`, so the emitted call is always `IOTaskHasEntitlement` and the
+string is always at **1**. Same for `IOCurrentTaskGetEntitlement`. Nine
+candidates were wrong before the binary check caught it.
+
 ## 4. Sanity-check against the shipped file
 
 Before trusting a new entry, grep `xnu.matchers` for the callee. If a dozen
@@ -93,14 +120,15 @@ emitted. Where they differ, the reason is in the last column.
 | `zone_create` | `_zone_create_ext` | 0 | 0 | trailing args added |
 | `zinit` | `_zinit` | 3 | 3 | |
 | `PE_parse_boot_argn` | `_PE_parse_boot_argn` | 0 | **1** | wrapper inlines to `_internal` |
-| `thread_set_thread_name` | `_thread_set_thread_name` | 1 | **2** | inlines to `bsd_setthreadname` |
+| `thread_set_thread_name` | `_thread_set_thread_name` | 1 | **2** or 1 | inlines to `bsd_setthreadname` at some sites only — see 3a |
 | `kern_coredump_log` | same | 1 | 1 | |
 | `tsleep`/`tsleep1`/`tsleep2` | as named | 2 | 2 | `wmesg` |
 | `msleep` family | as named | 3 | 3 | `wmesg` |
 | `lck_grp_init` | same | 1 | 1 | |
 | `SecureDTGetProperty` | same | 1 | 1 | property name |
 | `IOTaskHasEntitlement` | same | 1 | 1 | |
-| `IOCurrentTaskHasEntitlement` | same | 0 | 0 | |
+| `IOCurrentTaskHasEntitlement` | `_IOTaskHasEntitlement` | 0 | **1** | OS_ALWAYS_INLINE wrapper, NULL task prepended |
+| `IOCurrentTaskGetEntitlement` | `_IOTaskGetEntitlement` | 0 | **1** | same |
 | `mac_system_check_info` | same | 1 | 1 | |
 
 ## Highest-yield callees

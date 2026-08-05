@@ -85,24 +85,85 @@ Any decompressed kernel Mach-O works. If the user only has an IM4P kernelcache, 
 
 **Discard everything reported ABSENT.** It does not matter how right the source looked.
 
-## 4. Judge what survives — the part the script cannot do
+## 4. Resolve inlining and `arg#` against the binary
 
-The scanner emits *candidates*. Check each one you intend to keep:
+The scanner can only guess at inlining from `static` in the source, and takes
+`arg#` on faith from the `CALLSITES` table. The kernel answers both exactly,
+using data already in the file — no disassembler licence needed:
 
-- **Inlining.** The containing function must survive as its own function in the binary. A `static` function called from one place usually does not — the string ends up inside the *caller*, so the rule names the wrong function. The scanner tags these `[static - may be inlined]`; for those, walk up to the outermost non-inlined caller and use that name. Existing entries document exactly this, e.g. `_thread_init` carries a note that it inlines `machine_thread_init`.
-- **C++ symbols.** `.cpp` candidates are tagged `[C++ - needs mangled symbol]`. The existing file uses mangled names (`__ZN6OSKext14autounloadKextEPS_`) far more often than demangled ones — prefer mangled. Build it from the real signature, or confirm against a symbol you can already see in the companion file.
+```bash
+python3 scripts/xnu_inline_check.py --kernel <kernel-macho> --matchers candidates.txt
+```
+
+It decodes `LC_FUNCTION_STARTS` for real function boundaries (the same data
+disarm uses), scans `__text` for the ADRP+ADD / ADR pairs that materialise each
+string, and maps every candidate to the binary function that references it.
+Runs in under a second. Verdicts:
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| `OK` | one referencing function, unshared, and the string lands in the register the rule claims | trust the rule |
+| `ARGBAD` | the string is materialised into a different argument register than `arg#` says | fix `arg#` to the register reported |
+| `SHARED` | the binary function also holds strings belonging to *other* source functions — something was inlined | re-check which function to name; the report lists who else landed there |
+| `MULTI` | string referenced from more than one function | ambiguous; pick deliberately or drop |
+| `NOREF` | string present but no ADRP+ADD/ADR reference found | may be reached another way; verify by hand |
+
+`SHARED` is the name-free inlining tell: the kernel is stripped (`nsyms 0`), so
+nothing recovers names, but if candidates from two different source functions
+resolve to one binary function then at least one of them was inlined and names
+the wrong thing. Confirmed against source — e.g. `SecureDTInit` is small enough
+that its `panic("DeviceTree overflow:")` ends up inside `_PE_init_platform`, so
+a rule naming `_SecureDTInit` could never fire.
+
+`ARGBAD` works because the compiler almost always builds the string directly in
+its argument register: `ADRP X2, … ; ADD X2, X2, #201` *is* `arg# = 2`. It has
+already caught a real error — `IOCurrentTaskHasEntitlement` is `OS_ALWAYS_INLINE`
+and forwards to `IOTaskHasEntitlement(NULL, entitlement)`, so its string is at 1,
+not 0. Treat `CALLSITES` as a prior and this as the evidence.
+
+To see a call fully resolved, disassemble the function the checker names —
+disarm emulates registers and prints the synthesized call:
+
+```bash
+disarm -a 0x<func_start>-0x<func_start+0x80> <kernel>
+#  ADD X2, X2, #201  ; ... = 'Break 0x%04X instruction exception from kernel...'
+#  _snprintf(0xfffffe000b2f6aa0, 0x400, "Break 0x%04X instruction exception...")
+```
+
+Add `--only OK --bare` to emit clean matcher lines ready to append.
+
+**This check supersedes the `[static - may be inlined]` tag**, in both
+directions: of 638 source-flagged candidates in a full run, 286 were `OK` (false
+alarm, the function survived) and 352 were `SHARED`/`MULTI` (real problem). The
+tag is a prior; this is the evidence.
+
+## 5. Judge what is left — the part no script can do
+
+- **C++ symbols.** `.cpp` candidates are tagged `[C++ - needs mangled symbol]`, and no binary check helps: with `nsyms 0` there are no names in the kernel to compare against. The existing file uses mangled names (`__ZN6OSKext14autounloadKextEPS_`) far more often than demangled ones — prefer mangled, built from the real signature.
+- **`SHARED` candidates.** The report names the other source functions sharing the binary function. Usually the right fix is to name the *caller* instead of the inlined callee — that is what existing entries do, e.g. `_thread_init` carries a note that it inlines `machine_thread_init`.
 - **Uniqueness.** The scanner drops patterns whose truncated form appears more than once in the tree, but the *linker* also coalesces identical strings across the image. If a rule must share a pattern, place it after the existing one and note why.
 - **Unmapped callees.** With `--all-callees` the arg index is taken straight from the C source with no rewrite applied. Read the prototype and confirm before accepting.
+- **`ARGBAD` and `SHARED` on the same rule.** Only one verdict is reported per candidate; a rule can be wrong in both ways. Fix the function name first, then re-run.
 
-## 5. Append and report
+## 6. Append and report
 
 Add surviving rules to the end of their `arg#` section, each with a trailing `path/file.c` comment — the existing file uses that consistently and it is what makes the next pass maintainable. Keep the licence comment block intact.
 
-Report: source tag vs kernel version, candidates scanned, how many passed the kernel gate, how many you appended, and anything you rejected on judgement with the reason.
+Report: source tag vs kernel version, candidates scanned, how many passed the string gate, the `OK`/`SHARED`/`MULTI` split, how many you appended, and anything you rejected on judgement with the reason.
 
 ## Optional deeper verification
 
 Neither of these is required, and both have caveats worth knowing before spending time:
 
 - **`disarm --analyze`** regenerates the companion file and applies matchers, with `JMD=1` printing per-rule usage. Its "unused" report is **not** a reliable staleness signal — in testing against both a Darwin 24 and a Darwin 25 kernelcache it reported 455+ of 459 string rules unused while region/immediate rules fired normally, and no string-derived symbols reached the companion file. Treat a low used-count as "this check told us nothing", never as grounds to touch a rule. Note `--analyze` refuses to run when a companion file already exists, and `JA=1` is no longer supported.
-- **Binary Ninja** can confirm the argument register and the enclosing function properly. Headless automation needs a Commercial/Ultimate licence; a Personal licence fails at `_init_plugins` with "License is not valid" regardless of CLI availability. With a GUI-only licence, drive it from the built-in Python console instead of scripting it.
+- **Binary Ninja** buys less than it first appears. Enclosing function and `arg#` are both answered by `xnu_inline_check.py` and `disarm -a` for free, and C++ mangling is unanswerable from a stripped kernel either way. What a headless licence would add is proper dataflow for the residue — strings moved through a scratch register before the call, or an ADRP/ADD split across basic blocks, which the linear scan reports as `NOREF`. Headless needs Commercial/Ultimate; a Personal licence fails at `_init_plugins` with "License is not valid" regardless of CLI availability. Ghidra's `analyzeHeadless` is free and does the same dataflow.
+
+## Limits of the binary checks
+
+Worth knowing before trusting a verdict:
+
+- The ADRP page is tracked **per register in linear order**, not along control flow. Compilers emit ADRP+ADD adjacently in practice, but a pair split across basic blocks can be missed or mispaired. `NOREF` is the usual symptom.
+- `ARGBAD` reads the register the string is *built* in, not the one live at the call. A string built in x1 and moved to x2 before the call reads as arg 1. When a verdict looks wrong, disassemble the function and check — the `CALLSITES` prior and the shipped file are both evidence too.
+- `SHARED` is computed **only across the candidate set**. A binary function can hold inlined strings the scan never proposed, so `OK` means "nothing in this batch contradicts it", not "provably not inlined".
+- Function boundaries come from `LC_FUNCTION_STARTS`. If a kernel lacks it, this check cannot run at all — it exits rather than guessing.
+- Strings are read from `__cstring`, `__os_log`, and `__TEXT,__const`. A literal placed elsewhere reports `NOSTR` even though `strings` finds it.
