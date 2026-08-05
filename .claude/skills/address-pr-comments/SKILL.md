@@ -279,11 +279,14 @@ If verification says it's wrong, **reply instead of editing**:
 - **Push to the target §0 established, with §0's quoted refspec** — never a bare `git push`, which fails outright on a fallback checkout and, where it does resolve, may be aimed at a branch of your own rather than the PR's head. Then prove the push landed by **equality**, not by change: a concurrent push satisfies "the head moved" while your work sits unpushed.
 
   ```bash
+  remote=origin                                      # or the fork's remote, per §0
   expected=$(git rev-parse HEAD)
-  git push origin "HEAD:refs/heads/$head_ref"        # or the fork's remote, per §0
-  [ "$(gh pr view N --json headRefOid --jq '.headRefOid')" = "$expected" ] \
-    || echo "PR head is not your commit — stop and reconcile"
+  git push "$remote" "HEAD:refs/heads/$head_ref"
+  [ "$(git ls-remote "$remote" "refs/heads/$head_ref" | cut -f1)" = "$expected" ] \
+    || echo "push did not land as expected — stop and reconcile"
   ```
+
+  Check the **ref**, not the PR object. `gh pr view --json headRefOid` can serve a stale head for several seconds after a successful push, so a check built on it reports a mismatch that isn't real — and a verification step that cries wolf gets ignored exactly when it matters. `git ls-remote` reads the ref itself and is correct immediately.
 - **Reply only where it adds information**: declined, deferred, changed approach differently than asked, or a question answered. A nit you just fixed needs no prose — fix it and resolve the thread.
   - **gh:** `gh api -X POST repos/OWNER/REPO/pulls/N/comments/<databaseId>/replies -f body='…'`
   - **MCP:** `add_reply_to_pull_request_comment` (numeric `commentId`, not the `PRRT_…` node id) — the same tool takes a `reaction`, so a bare 👍 on a comment that needed no prose is one call, not a wasted paragraph.
