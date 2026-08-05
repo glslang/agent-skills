@@ -5,7 +5,7 @@ description: Work through review feedback on a pull request — sync the branch 
 
 # Address PR Review Comments
 
-Take a PR from "review comments outstanding" to "every thread has an outcome". For each thread the outcome is one of: **fixed**, **declined with evidence**, **deferred to an issue**, or **escalated to the human**. Nothing is accepted because a reviewer said it, and nothing is left dangling because it got tedious.
+Take a PR from "review comments outstanding" to "every thread has an outcome". For each thread the outcome is one of: **fixed**, **declined with evidence**, **deferred to an issue**, **noted** (an advisory nit, read and deliberately left), or **escalated to the human**. Nothing is accepted because a reviewer said it, and nothing is left dangling because it got tedious.
 
 Two failure modes this skill exists to prevent:
 
@@ -39,9 +39,26 @@ gh pr checkout N                      # handles fork PRs; prefer it
 git status --porcelain                # must be clean; stash or stop if not
 gh pr view N --json headRefName,headRefOid --jq '.headRefName + " " + .headRefOid'
 git rev-parse HEAD                    # must equal headRefOid
+git rev-parse --abbrev-ref '@{push}'  # must resolve — see "writable checkout" below
 ```
 
 If the head SHA doesn't match after checkout, stop and find out why (someone pushed, or you're on a stale fetch) rather than committing on top. On the MCP path with no local checkout, you have no local branch to get wrong — but you also cannot author fixes; restrict yourself to replies, resolutions, and issue filing.
+
+**A correct checkout is not yet a writable one.** `refs/pull/N/head` is read-only, and the fallback's `git switch -C pr-N FETCH_HEAD` leaves the branch with no upstream at all — so §5's plain `git push` dies on *"fatal: The current branch has no upstream branch"* after you have already authored every fix. `gh pr checkout` configures the push target for you; the fallback does not. Settle it now, before writing anything:
+
+```bash
+gh pr view N --json headRepositoryOwner,headRepository,headRefName,maintainerCanModify
+# MCP: pull_request_read method:"get" → head.repo.owner.login, head.repo.name,
+#      head.ref, maintainer_can_modify
+```
+
+| Head repo | Push target |
+|---|---|
+| Same repo as base | `git push -u origin HEAD:<headRefName>` on the first push, plain `git push` after. |
+| A fork, `maintainerCanModify: true` | Add the contributor's repo as a remote and push the head branch by name: `git remote add contributor https://github.com/<headRepositoryOwner.login>/<headRepository.name>.git` then `git push -u contributor HEAD:<headRefName>`. |
+| A fork, `maintainerCanModify: false` | **You cannot deliver fixes at all.** Say so before triaging and work the PR like the MCP-only path — replies, resolutions, issues. Authoring commits you can't push wastes the whole sweep. |
+
+`maintainerCanModify` is only meaningful on a fork PR; it reads `false` on same-repo PRs, where it doesn't apply. Push the head branch **by name** (`HEAD:<headRefName>`), not `pr-N` — the local branch name is yours, the remote one is the PR's.
 
 **Stop immediately if the PR is already `MERGED` or `CLOSED`.** Check `state` on the same read that resolves the PR, before collecting anything. A merged PR cannot take fixes — pushing to its branch changes nothing, and replying to its threads asks people to re-litigate finished work. Report that it's merged and stop. This is a hard terminal condition, not a preference; re-check it on every wake in watch mode (§8).
 
@@ -54,10 +71,14 @@ Then decide **mode**:
 
 Not every reviewer carries the same weight, and treating them equally is how a PR stalls on advisory noise. Sort them once, up front:
 
-- **Judges** — sign-off actually matters; their unresolved objections block. Human reviewers with `CHANGES_REQUESTED`, code owners, and whichever bot the team actually trusts (commonly Codex).
+- **Judges** — sign-off actually matters; their unresolved objections block. Code owners, humans whose review was requested or who have reviewed at all, and whichever bot the team actually trusts (commonly Codex).
 - **Advisory** — worth reading, never blocking. Everything else, including bots the team treats as nice-to-have.
 
+**Weight attaches to the reviewer, not to their current verdict.** A code owner who requested changes and then approved is still a judge — what changed is that they're now *satisfied*, which is a §9 question, not a re-sort. Sorting on verdicts instead would quietly demote every reviewer the moment they stopped objecting, and re-promote them on their next comment.
+
 Ask the user if it isn't obvious, and take their answer as standing configuration for the PR. An advisory reviewer's findings still get verified and fixed when they're right — the difference is only that its silence, its rate limit, and its unaddressed nits never hold up merge readiness (§9).
+
+**Record the weight on every ledger row (§2), not just in your head.** The split only does its job at the §9 gate, which runs long after this decision and reads nothing but the ledger. A row with no `weight` is a row that blocks.
 
 ## 1. Sync with the base branch
 
@@ -84,7 +105,7 @@ git merge --ff-only FETCH_HEAD             # fails loudly if you had local commi
 
 Use `--ff-only` deliberately: if it refuses, you have unpushed local work and need to reconcile it, which is exactly the moment you want to notice.
 
-**Fetch `refs/pull/N/head`, not `origin/<headRefName>`.** On a fork PR the head branch does not exist in the base repo, so `git fetch origin <headRefName>` fails outright and leaves you on the stale commit this step exists to avoid. The base repo's `refs/pull/N/head` always resolves, for forks and same-repo branches both. Pushing is the asymmetric part: `refs/pull/N/head` is read-only, so a fork fix goes to the contributor's remote and only works if they enabled "allow edits from maintainers" — check before you start authoring one.
+**Fetch `refs/pull/N/head`, not `origin/<headRefName>`.** On a fork PR the head branch does not exist in the base repo, so `git fetch origin <headRefName>` fails outright and leaves you on the stale commit this step exists to avoid. The base repo's `refs/pull/N/head` always resolves, for forks and same-repo branches both. Pushing is the asymmetric part — `refs/pull/N/head` is read-only, so fetch and push are different refs on a fork PR. §0's push-target table is the authority on where the push goes; it should already be settled by the time you get here.
 
 **Force-pushing marks existing line comments "outdated" and collapses them** — which is why §2 runs first. After the rebase, re-check each collected thread against its new anchor: the line moved, the ask may still stand.
 
@@ -126,6 +147,22 @@ query($owner:String!, $repo:String!, $number:Int!, $endCursor:String) {
 **Both connections can truncate, and truncation is silent.** `--paginate` walks the outer `reviewThreads` using `$endCursor`, but the nested `comments` has its own cursor that `--paginate` will not follow — a thread with more than 100 comments needs a follow-up query of its own. Check `hasNextPage` on both; a dropped thread or a dropped last reply is an ask that never enters the ledger, and the skill then reports the review complete while it isn't. This is exactly the failure §9 is supposed to prevent.
 
 Plus `gh pr view N --json reviews,comments`.
+
+### One current verdict per reviewer
+
+**A review's `state` is frozen at submission — derive each reviewer's *present* verdict yourself.** The `pullRequestReview { id state }` join above says which review a comment shipped in, not what its author thinks now. A reviewer who requested changes and later approved leaves every one of those comments pointing at a `CHANGES_REQUESTED` review object forever. Anything that asks *"is this reviewer blocking?"* must read the fold below, never the state hanging off the comment:
+
+```bash
+gh pr view N --json reviews --jq '
+  [.reviews[] | select(.state != "COMMENTED" and .state != "PENDING")]
+  | group_by(.author.login)
+  | map({author: .[0].author.login,
+         verdict: (sort_by(.submittedAt) | last | .state)})'
+```
+
+**MCP:** `pull_request_read` `method: "get_reviews"`, then the same fold by hand.
+
+Drop `COMMENTED` from the fold: GitHub doesn't treat it as a verdict, so a chatty follow-up review never clears a standing `CHANGES_REQUESTED` — count it as clearing and you'll walk past a live objection. `DISMISSED` and `APPROVED` do clear it. Two consumers depend on this table and nothing else: §9's "no outstanding `CHANGES_REQUESTED`" gate, and the "just the blocking ones" filter (§ Inputs).
 
 **MCP** — `pull_request_read` with `method: "get_review_comments"` (returns threads with `isResolved` / `isOutdated`), then `method: "get_reviews"`, then `method: "get_comments"`. Page with `perPage` + `after`.
 
@@ -173,16 +210,20 @@ Filter to what's actually actionable:
 
 Keep a file in the scratchpad — `pr-<N>-feedback.md` — **one row per actionable ask, from all three surfaces**, not one row per review thread. This survives context compaction, and §6's loop detection is impossible without it:
 
-| source | thread id | comment id | path:line | ask (one line) | rounds | last action | status |
-|---|---|---|---|---|---|---|---|
+| source | weight | thread id | comment id | path:line | ask (one line) | rounds | last action | status |
+|---|---|---|---|---|---|---|---|---|
 
 Keep the `signoff: 👍 @ <SHA>` note here too (§6) — it's the only place a reaction's head binding can live, since the reaction itself carries none.
 
 `source` ∈ `thread` / `review-body` / `pr-comment`. The last two have no thread to resolve and no `isResolved` flag to filter on, so if they don't get a row they are tracked nowhere at all — and §9's "no open rows" then passes over an ask nobody ever answered. A blocking objection stated only in a `COMMENTED` review body is the classic case: it isn't `CHANGES_REQUESTED`, so no other check catches it either.
 
+`weight` ∈ `judge` / `advisory`, from the §0 split, keyed on the row's *author* — a judge and an advisory bot can both comment in one thread, so weight is per row, not per thread. This is the column §9 reads to let advisory nits through the gate; without it the split is decorative.
+
 Split a multi-part comment into one row per ask. A review body listing four problems is four rows; one row marked "addressed" hides the three you didn't do.
 
-`status` ∈ `open` / `fixed` / `declined` / `deferred:#issue` / `escalated`. Update it as you go — it is the source of truth for the final report and for whether a returning comment is round 1 or round 3.
+`status` ∈ `open` / `fixed` / `declined` / `deferred:#issue` / `noted` / `escalated`. Update it as you go — it is the source of truth for the final report and for whether a returning comment is round 1 or round 3.
+
+**`noted` is the terminal status for an advisory ask you deliberately aren't acting on** — a nit the §6 stop policy declined to spend another push on, a taste comment from a non-judge, anything read and consciously left. It exists because the alternative is leaving those rows `open`, which stalls the PR on exactly the feedback §0 sorted as non-blocking. It is **not** available on a `judge` row: a judge's finding leaves the ledger `fixed`, `declined`, `deferred`, or `escalated`, and never by being waved through. `noted` also isn't `declined` — declining is an argument with evidence (§4), noting is "seen, not worth the round". Every `noted` row is named in the final report (§10) so the human can overrule it.
 
 Keep a second, much smaller tally at the top of the same file — one line per review round: `round N (commit abc123): 6 findings, 2 real bugs, 4 nits`. Per-thread rounds catch a reviewer repeating themselves; this catches a bot generating fresh findings on every push, which is a different loop and the more common one (§6).
 
@@ -228,10 +269,11 @@ If verification says it's wrong, **reply instead of editing**:
 
 - **Batch.** One review with eight comments → one commit (or a few logical ones) and one push, not eight. Every push re-triggers CI and, in repos with "dismiss stale reviews", drops approvals.
 - **Commit messages name the feedback**: `Guard against empty batch (review: #N)`.
+- **Push to the target §0 established**, not to whatever `git push` defaults to. Same-repo PR → `origin`; fork PR → the contributor's remote, `git push contributor HEAD:<headRefName>`. A bare `git push` on a branch created from `refs/pull/N/head` has no upstream and fails outright; worse, one that *does* resolve may be aimed at a branch of your own rather than the PR's head. Confirm with `git rev-parse --abbrev-ref '@{push}'` before the first push, and re-read `headRefOid` after it to prove the PR moved.
 - **Reply only where it adds information**: declined, deferred, changed approach differently than asked, or a question answered. A nit you just fixed needs no prose — fix it and resolve the thread.
   - **gh:** `gh api -X POST repos/OWNER/REPO/pulls/N/comments/<databaseId>/replies -f body='…'`
   - **MCP:** `add_reply_to_pull_request_comment` (numeric `commentId`, not the `PRRT_…` node id) — the same tool takes a `reaction`, so a bare 👍 on a comment that needed no prose is one call, not a wasted paragraph.
-- **Resolve threads you actually addressed** — `gh api graphql` `resolveReviewThread` / **MCP** `resolve_review_thread` (needs the `PRRT_…` node id). Some teams want the reviewer to resolve; if the repo's other PRs show reviewer-resolved threads, reply and leave it open.
+- **Resolve threads you actually addressed** — `gh api graphql` `resolveReviewThread` / **MCP** `resolve_review_thread` (needs the `PRRT_…` node id). Some teams want the reviewer to resolve; if the repo's other PRs show reviewer-resolved threads, reply and leave the thread unresolved. That's GitHub's resolved flag, not the ledger: the row is still `fixed`, because §9 gates on the status you wrote, not on who clicked resolve.
 - **Watch CI after the push.** A failure caused by your fix is part of this task, not a separate one.
 - Update the ledger row for each thread touched.
 
@@ -283,7 +325,7 @@ Two more stop signals, either one sufficient regardless of count:
 - **Severity is trending down.** Round 1 found a data-loss bug; round 4 wants a doc comment reworded. The valuable passes are over — take the remaining nits or leave them, but stop cycling.
 - **New findings are in code the last round just touched.** The bot is reviewing your fixes, not the PR.
 
-When you stop, say so in the thread — "addressed rounds 1–3; remaining items are nits, merging" — so the record shows a decision rather than an abandonment. And **batch hard**: with a bot on the PR, every extra push is not just another CI run, it's another six findings.
+When you stop, say so in the thread — "addressed rounds 1–3; remaining items are nits, merging" — so the record shows a decision rather than an abandonment. **Then close the rows you just decided not to fix**: `noted` if the finding came from an advisory reviewer (§2), and it's off the §9 gate. If it came from a *judge*, stopping the loop doesn't dispose of it — that row still needs `fixed`, `declined` with evidence, `deferred:#issue`, or `escalated`. Leaving either kind `open` turns "we stopped cycling" into "the PR is blocked", which is the same sentence read two different ways. And **batch hard**: with a bot on the PR, every extra push is not just another CI run, it's another six findings.
 
 **Bots fail in ways that look like silence** — none of these mean "no findings", but they don't all mean the same thing either. What matters is whether a pass is *coming*:
 
@@ -333,7 +375,7 @@ Where a bot does ack a thread, treat that as the thread closing:
 
 - Ack received → mark the thread `fixed` / `declined` in the ledger, resolve it, **stop working on it**. Re-litigating a point the bot already conceded is the exact ad-infinitum loop this skill exists to break.
 - Ack on a decline is the bot agreeing you were right. Don't then make the change anyway.
-- No ack after two rounds → the bot has nothing more to add. Close it out yourself with a one-line note in the ledger and move on; a bot won't escalate, so there's no one to wait for.
+- No ack after two rounds → the bot has nothing more to add. Close it out yourself and move on; a bot won't escalate, so there's no one to wait for. "Close it out" means writing the status you actually reached — `fixed`, `declined`, or `noted` on an advisory row — not a note beside a row still reading `open`.
 
 The body 👍 feeds merge readiness directly — see §9.
 
@@ -361,7 +403,7 @@ How:
 2. Reply in the thread with the link and say plainly that this PR is **not** doing it, so the reviewer can object while they still have leverage.
 3. Ledger status → `deferred:#<issue>`.
 
-**A blocking concern needs the reviewer's ack before you defer it.** If the review is `CHANGES_REQUESTED` and this thread is the reason, propose the issue and wait — don't file, resolve, and merge past them.
+**A blocking concern needs the reviewer's ack before you defer it.** If the reviewer's current verdict is `CHANGES_REQUESTED` (§2's fold) and this thread is the reason, propose the issue and wait — don't file, resolve, and merge past them.
 
 ## 8. Watch mode — comments as they arrive
 
@@ -373,7 +415,7 @@ On each event:
 
 0. **Check the PR is still open, first.** If it's `MERGED` or `CLOSED`, stop — unsubscribe, report, and do not act on the event. Merges and closes routinely happen while you're mid-cycle, and a fix pushed after the merge lands nowhere while a reply reopens settled work. This check precedes everything else on every wake.
 1. **Skip echoes** — events for comments you authored.
-2. **Deduplicate on the event, not the thread.** Skip a comment id you've already processed. Do **not** skip an event because its thread's ledger row is terminal — a reviewer replying to something you `declined` or `deferred` is precisely the round-2 event §6 is built around, and dropping it means renewed objections are never heard and the PR gets reported clear over the top of them. A new comment on a terminal row **reopens it**: status back to `open`, `rounds` +1, then triage as normal.
+2. **Deduplicate on the event, not the thread.** Skip a comment id you've already processed. Do **not** skip an event because its thread's ledger row is terminal — a reviewer replying to something you `declined`, `deferred`, or `noted` is precisely the round-2 event §6 is built around, and dropping it means renewed objections are never heard and the PR gets reported clear over the top of them. A new comment on a terminal row **reopens it**: status back to `open`, `rounds` +1, then triage as normal.
 3. Run §2 → §5 for the new items only. Sync with base (§1) if the event says the PR went behind or conflicted.
 4. CI-failure events on your own PR: diagnose and push a fix, or reply saying exactly what's failing and why it isn't yours. Never end a CI-failure wake silently.
 5. Re-run §6's check every time — a returning comment on a thread already at round 2 is round 3, and the ledger is how you know.
@@ -391,10 +433,10 @@ Once every ledger row is terminal, say explicitly whether the PR is clear.
 
 The PR is clear when **all** of these hold:
 
-- No `open` and no `escalated` rows. Every thread is `fixed`, `declined`, or `deferred:#issue` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7.
-- No outstanding `CHANGES_REQUESTED` review from a human. An approval that got dismissed by your push needs re-requesting, not ignoring.
-- **Every judge is satisfied** (§0). For a bot judge that means a completed pass against the current head with no new findings — by 👍, by an empty review on this SHA, or by two quiet rounds (§6). A 👀 means a pass is running: wait. A missing reaction means nothing on its own; don't gate on one. On the MCP-only path sign-off is unverifiable — report it as unknown rather than assuming either way.
-- **Advisory reviewers never block.** Their real findings still get fixed, but rate-limiting, silence, and outstanding nits from an advisory bot are reported, not waited on.
+- No `open` and no `escalated` rows. Every row is `fixed`, `declined`, `deferred:#issue`, or `noted` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7. `noted` is legal only on an `advisory` row (§2); a judge's ask never leaves this gate unaddressed.
+- No reviewer whose **current** verdict (§2's fold, not the state on any individual comment) is `CHANGES_REQUESTED`. A reviewer who requested changes and has since approved is not blocking, and a reviewer who approved and has since requested changes is — read the fold both ways. An approval that got dismissed by your push needs re-requesting, not ignoring.
+- **Every judge is satisfied** (§0). For a *human* judge that means their current verdict isn't `CHANGES_REQUESTED` — satisfied, not necessarily approving. Don't read "satisfied" as "must have approved": a code owner who commented and moved on has nothing outstanding, and waiting for an approval the repo's branch protection doesn't require is a stall of your own making. For a *bot* judge it means a completed pass against the current head with no new findings — by 👍, by an empty review on this SHA, or by two quiet rounds (§6). A 👀 means a pass is running: wait. A missing reaction means nothing on its own; don't gate on one. On the MCP-only path sign-off is unverifiable — report it as unknown rather than assuming either way.
+- **Advisory reviewers never block.** Their real findings still get fixed, but rate-limiting, silence, and unaddressed nits from an advisory reviewer are reported, not waited on. The mechanism is the `noted` status — an advisory nit you decided against is closed out, not left `open` for the first gate to trip over. "Never blocks" and "must not be `open`" are the same rule stated twice; if you find yourself waiting on an advisory row, the row is mis-statused.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
 
 `mergeStateStatus: CLEAN` plus a Codex 👍 on the PR body is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done. Read the reaction before deciding anything is outstanding: it costs one call, and skipping it is how a cleared PR sits untouched waiting for a comment that is never coming.
@@ -410,6 +452,7 @@ When the outstanding threads are all in a terminal state:
 - **Fixed:** thread → one-line description of the change
 - **Declined:** thread → the claim and why it doesn't hold
 - **Deferred:** thread → issue link and the reason it's out of scope
+- **Noted:** thread → the advisory nit and the one-line reason you left it. List every one; they cleared the gate without being addressed, and the human is the only one who can say that was wrong.
 - **Escalated:** thread → the disagreement, in one sentence, and who needs to decide
 - **Branch state:** synced with base / conflicts resolved / CI green or red
 
@@ -428,6 +471,8 @@ Anything still `open` — or `escalated` without a recorded decision — is unfi
 - **Force-push collapses line comments as outdated.** Collect threads before rebasing, and expect the reviewer to lose their place — reply with what changed rather than assuming they can see it.
 - **Pushing dismisses approvals** in repos with "dismiss stale reviews on push". That's a cost of fixing things, not a reason to withhold a fix — but it is a reason to batch.
 - **A comment on an outdated line may still be live.** Read the ask, not the anchor.
+- **`refs/pull/N/head` fetches but never pushes.** A branch made from it has no upstream, so `git push` fails with "no upstream branch" — at the end of the sweep, after the fixes are written. Establish the push target at checkout (§0), not at push time.
+- **A review's `state` is a fact about a moment, not about a reviewer.** `CHANGES_REQUESTED` stays on that review object after its author approves. Fold the review history to one current verdict per author (§2) and read that instead, everywhere the question is "is anyone blocking".
 - **Review bodies carry asks too.** A review whose blocking objection lives only in the body has no thread, no `isResolved` flag, and nothing to resolve — it exists only if you gave it a ledger row (§2). Answer it with a plain PR comment (`gh pr comment` / `add_issue_comment`), since there is no thread to reply into.
 - **Suggestion blocks commit as you.** Verify before applying; "the reviewer suggested it" is not a defense for a broken commit.
 - **Don't resolve a thread you declined** unless the reviewer agreed. Resolving your own dissent reads as steamrolling — leave it open for them to close.
@@ -440,7 +485,7 @@ Anything still `open` — or `escalated` without a recorded decision — is unfi
 - "address the comments on #N" → sweep mode, full procedure.
 - "rebase and address comments" → §1 with the rebase path explicitly, then sweep.
 - "watch this PR" / "handle comments as they come in" → watch mode (§8).
-- "just the blocking ones" → keep threads whose comments carry `pullRequestReview.state == CHANGES_REQUESTED`; report the rest as untouched. This is why §2's query pulls `pullRequestReview { id state }` on each comment — without that join there is nothing linking a thread to the review it came from, and the filter silently picks the wrong set in both directions.
+- "just the blocking ones" → keep threads whose **author's current verdict** is `CHANGES_REQUESTED` per §2's fold; report the rest as untouched. Resolve each thread to its originating comment's author, then look that author up in the fold — do **not** filter on the comment's own `pullRequestReview.state`. That state is a historical fact about a submitted review and never changes, so a reviewer who requested changes in round 1 and approved in round 2 still has every one of those comments joined to a `CHANGES_REQUESTED` object, and filtering on it hands back a "blocking" set nobody is blocking on. The `pullRequestReview { id state }` join is still worth pulling — it tells you which round a comment belongs to — but provenance is not a verdict.
 - "don't push back, just do what they say" → skip §4's decline path, but still verify before applying and still stop at §6's round cap.
 - "file issues for anything big" → lower §7's bar; still never defer a small in-scope fix.
 - "merge it once the comments are cleared" → run the sweep, then §9's merge path without asking again.
