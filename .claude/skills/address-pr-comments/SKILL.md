@@ -179,6 +179,14 @@ gh pr view N --json reviews --jq '
 
 **MCP:** `pull_request_read` `method: "get_reviews"`, then the same fold by hand.
 
+**The fold only covers people who reviewed.** A reviewer who was asked and hasn't answered has no row in it at all, and "no row" reads as "not blocking" unless you look somewhere else — so pull the pending requests in the same breath, or §9 will pass a PR nobody has looked at yet:
+
+```bash
+gh pr view N --json reviewRequests --jq '[.reviewRequests[].login]'   # asked, not yet answered
+```
+
+GitHub drops a reviewer from that list the moment they submit a review, so non-empty means genuinely outstanding.
+
 Drop `COMMENTED` from the fold: GitHub doesn't treat it as a verdict, so a chatty follow-up review never clears a standing `CHANGES_REQUESTED` — count it as clearing and you'll walk past a live objection. `APPROVED` clears it outright. `DISMISSED` clears the *block* but is not a sign-off — it means a verdict existed and was revoked, which §9 handles as its own state. Two consumers depend on this table and nothing else: §9's gate, and the "just the blocking ones" filter (§ Inputs).
 
 **MCP** — `pull_request_read` with `method: "get_review_comments"` (returns threads with `isResolved` / `isOutdated`), then `method: "get_reviews"`, then `method: "get_comments"`. Page with `perPage` + `after`.
@@ -461,9 +469,22 @@ Once every ledger row is terminal, say explicitly whether the PR is clear.
 The PR is clear when **all** of these hold:
 
 - No `open` and no `escalated` rows. Every row is `fixed`, `declined`, `deferred:#issue`, or `noted` — and a `deferred` row on a blocking concern needs the reviewer's ack per §7. `noted` is legal only on an `advisory` row (§2); a judge's ask never leaves this gate unaddressed.
-- No **judge** whose **current** verdict (§2's fold, not the state on any individual comment) is `CHANGES_REQUESTED` **or `DISMISSED`**. A reviewer who requested changes and has since approved is not blocking, and one who approved and has since requested changes is — read the fold both ways. `DISMISSED` is the third case and it is neither a block nor a pass: a verdict existed and was revoked, usually by your own push under "dismiss stale reviews", so the approval the repo was counting on is gone. Re-request that review and report the PR as not clear — "it isn't `CHANGES_REQUESTED`" is not the same as satisfied. A judge who only ever left `COMMENTED` is the genuinely different case: they never held a verdict to lose, so the next bullet's "satisfied, not necessarily approving" applies to them and not to a dismissal. An *advisory* `CHANGES_REQUESTED` doesn't block here either, by the same rule as everything else advisory; if the repo's branch protection blocks the merge on it regardless, that's a settings fact to report, not a thread to keep working.
-- **Every judge is satisfied** (§0). For a *human* judge that means their current verdict isn't `CHANGES_REQUESTED` — satisfied, not necessarily approving. Don't read "satisfied" as "must have approved": a code owner who commented and moved on has nothing outstanding, and waiting for an approval the repo's branch protection doesn't require is a stall of your own making. For a *bot* judge it means a completed pass against the current head with no new findings — by 👍, by an empty review on this SHA, or by two quiet rounds (§6). A 👀 means a pass is running: wait. A missing reaction means nothing on its own; don't gate on one. On the MCP-only path sign-off is unverifiable — report it as unknown rather than assuming either way.
-- **Advisory reviewers never block.** Their real findings still get fixed, but rate-limiting, silence, and unaddressed nits from an advisory reviewer are reported, not waited on. The mechanism is the `noted` status — an advisory nit you decided against is closed out, not left `open` for the first gate to trip over. "Never blocks" and "must not be `open`" are the same rule stated twice; if you find yourself waiting on an advisory row, the row is mis-statused.
+- **Every judge is satisfied**, by the table below. §0 says who the judges are; §2's fold says what their verdict is — never the state on an individual comment. Every state a judge can be in appears here, because the gap that lets a PR through is always the state nobody enumerated:
+
+  | Judge's state | Reading |
+  |---|---|
+  | Still listed in `reviewRequests` — asked, hasn't responded | **Pending. Blocks.** Report the PR as awaiting review. |
+  | Latest verdict `CHANGES_REQUESTED` | **Blocks.** |
+  | Latest verdict `DISMISSED` | **Blocks.** A verdict existed and was revoked, usually by your own push under "dismiss stale reviews" — the sign-off the repo was counting on is gone. Re-request it. |
+  | Latest verdict `APPROVED` | Satisfied. |
+  | Reviewed, but only ever `COMMENTED` | Satisfied — they engaged and left nothing outstanding. Demanding an approval they never meant to give is a stall of your own making. |
+  | Bot with 👀 on the PR body | **Pending. Wait** — don't push into a running pass. |
+  | Bot with a completed pass on the current head and no new findings — 👍, an empty review on this SHA, or two quiet rounds (§6) | Satisfied. |
+  | Bot that is rate-limited | Not blocking. Absent, not pending (§6). Report it. |
+  | Bot with no signal either way | Unknown. Don't gate on it; say so. On the MCP-only path a reaction's author is unreadable, so bot sign-off lands here by default (§2). |
+
+  Read a reviewer's presence in `reviewRequests` (`gh pr view N --json reviewRequests`) as the human half of this, and §6's table as the bot half. **The two failure directions are symmetric:** treat *pending* as satisfied and you merge past a review that was on its way; treat *absent* as pending and you wait forever for one that was never coming. "Not `CHANGES_REQUESTED`" decides neither — silence from someone who never answered and silence from someone who answered "no notes" look identical in the fold, and only the table tells them apart.
+- **Advisory reviewers never block** — no row of that table applies to them. Not a pending request, not `CHANGES_REQUESTED`, not `DISMISSED`. Their real findings still get fixed, but rate-limiting, silence, and unaddressed nits from an advisory reviewer are reported, not waited on. (If the repo's branch protection blocks the merge on an advisory verdict anyway, that's a settings fact to report, not a thread to keep working.) The mechanism is the `noted` status — an advisory nit you decided against is closed out, not left `open` for the first gate to trip over. "Never blocks" and "must not be `open`" are the same rule stated twice; if you find yourself waiting on an advisory row, the row is mis-statused.
 - CI green on the head commit, and the branch not `BEHIND` or `DIRTY`.
 
 `mergeStateStatus: CLEAN` plus a Codex 👍 on the PR body is the ordinary "this can go in now" state — report it as such rather than idling on a PR that is already done. Read the reaction before deciding anything is outstanding: it costs one call, and skipping it is how a cleared PR sits untouched waiting for a comment that is never coming.
