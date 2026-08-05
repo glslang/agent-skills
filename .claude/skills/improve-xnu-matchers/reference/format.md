@@ -75,6 +75,34 @@ read back automatically on later runs to skip re-analysis.
 - `disarm --refs 0x<addr> <binary>` is documented to list references, but
   returned nothing for `__TEXT.__cstring` addresses in testing.
 
+## Binary structures the checks rely on
+
+Verified against `kernel.rebuilt` (xnu-12377.2.8, arm64e):
+
+| Structure | Why it matters |
+|---|---|
+| `LC_SYMTAB` with `nsyms 0` | the kernel is fully stripped — no tool recovers names, only structure |
+| `LC_FUNCTION_STARTS` (34000 bytes → 20505 functions) | exact function boundaries, ULEB128 deltas from the `__TEXT` vmaddr |
+| `__TEXT,__cstring` (0x7b948) | the bulk of string literals |
+| `__TEXT,__os_log` (0x3c2f3) | **every `os_log` format string** — miss this section and all arg-3 `_os_log_internal` candidates come back unresolvable |
+| `__TEXT,__const` | some literals, including the version banner |
+| `__KLDDATA,__cstring` | small, KLD-only |
+| `__TEXT_EXEC,__text` (0x89c614) plus `__hib_text`, `__bootcode`, `__KLD,__text` | the executable ranges to scan for xrefs |
+
+Two traps found while implementing this:
+
+- **A rebuilt kernel has several `__cstring` sections.** Keeping only the last
+  one yields 56 strings instead of 35191.
+- **The `LC_FUNCTION_STARTS` tail is not a clean terminator.** Decoding to the
+  end of `datasize` runs past the address space (a 65-bit value on this kernel).
+  Filter starts to those landing inside an executable section.
+
+The kernel version is in the binary itself:
+
+```bash
+strings -a <kernel> | grep -o 'xnu-[0-9.]*' | sort -u
+```
+
 ## Caveat on `JMD=1`
 
 The unused-rule report is not a usable staleness signal. Against both

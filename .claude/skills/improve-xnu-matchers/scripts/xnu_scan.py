@@ -94,8 +94,10 @@ CALLSITES = {
     "SecureDTGetProperty": ("_SecureDTGetProperty",          1, 1),
     "SecureDTFindEntry": ("_SecureDTFindEntry",              0, 0),
     "IOTaskHasEntitlement": ("_IOTaskHasEntitlement",        1, 1),
-    "IOCurrentTaskHasEntitlement": ("_IOCurrentTaskHasEntitlement", 0, 0),
-    "IOCurrentTaskGetEntitlement": ("_IOCurrentTaskGetEntitlement", 0, 0),
+    # Both IOCurrentTask* wrappers are OS_ALWAYS_INLINE and forward to the
+    # task-taking form with a NULL task, so the string always lands at 1.
+    "IOCurrentTaskHasEntitlement": ("_IOTaskHasEntitlement",  0, 1),
+    "IOCurrentTaskGetEntitlement": ("_IOTaskGetEntitlement",  0, 1),
     "mac_system_check_info": ("_mac_system_check_info",      1, 1),
     "getsectbynamefromheader": ("_getsectbynamefromheader",  1, 1),
     "vnode_open":      ("_vnode_open",                       0, 0),
