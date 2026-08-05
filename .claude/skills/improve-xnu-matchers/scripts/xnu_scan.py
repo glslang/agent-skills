@@ -126,7 +126,25 @@ ARCH_SKIP = {
     "any": re.compile(r"(?!)"),
 }
 
-INLINE_RE = re.compile(r"\b(?:__inline|inline|always_inline)\b")
+# Matches lowercase `inline`/`__inline` and the uppercase macro spellings XNU
+# actually uses -- OS_ALWAYS_INLINE, __header_always_inline. Missing these lets
+# a guaranteed-inlined function through as a candidate, and xnu_inline_check
+# cannot always catch it: SHARED needs a *second* candidate in the same binary
+# function, so a lone inlined string reports OK.
+INLINE_RE = re.compile(r"\b(?:__inline\w*|inline|\w*_inline)\b", re.I)
+
+# Trailing tokens that can sit between the parameter list and a column-0 body
+# brace: `) const {`, `) OS_ALWAYS_INLINE {`, `) __attribute__((noreturn)) {`.
+QUALIFIER_WORDS = {"const", "volatile", "noexcept", "override", "final",
+                   "mutable", "restrict", "throw"}
+
+# Only these may precede a *parenthesised* group and still not be the
+# declarator. This must stay a closed set: XNU names real functions in caps
+# (__ZONE_MAP_EXHAUSTED_AND_WAITING_FOR_GC__,
+# _SENDING_NOTIFICATION__THIS_COALITION_IS_CAUSING_TOO_MUCH_IO), and treating
+# "looks like a macro" as attribute-like there discards them silently.
+ATTR_CALLS = {"__attribute__", "__attribute", "__printflike", "__declspec",
+              "__asm", "__asm__", "alignas", "noexcept", "throw"}
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[~A-Za-z_][A-Za-z0-9_]*)*$")
 CONFIG_RE = re.compile(r"\b(DEVELOPMENT|DEBUG|MACH_ASSERT|CONFIG_[A-Z0-9_]+|XNU_[A-Z0-9_]+|__x86_64__|__i386__)\b")
 
@@ -197,37 +215,81 @@ def blank(src):
     return "".join(out), spans
 
 
+def trailing_ident(skeleton, end):
+    """Identifier ending at `end` (exclusive), plus its start index."""
+    lo = max(0, end - 300)
+    seg = skeleton[lo:end].rstrip()
+    m = IDENT_RE.search(seg)
+    if not m:
+        return None, None
+    return m.group(0), lo + len(seg) - len(m.group(0))
+
+
+def bare_qualifier(ident):
+    """A bare trailing word that decorates a declarator rather than naming it.
+
+    Safe to treat caps as macro-ish here: a function name is always followed by
+    its parameter list, so a bare word before the brace is never the name.
+    """
+    return ident in QUALIFIER_WORDS or (ident.upper() == ident and ident.isupper())
+
+
+def declarator(skeleton, brace_pos):
+    """Walk back from a column-0 '{' to the real declarator.
+
+    A definition can put qualifiers or attributes between the parameter list
+    and the brace -- `) const {` on C++ members, `) OS_ALWAYS_INLINE {`,
+    `) __attribute__((noreturn)) {`. Stopping at the first ')' names
+    `__attribute__` as the function; requiring ')' immediately before the brace
+    skips every `const` member outright. Both are silent. Returns
+    (open_paren_index, name) or (None, None).
+    """
+    j = brace_pos - 1
+    for _ in range(8):
+        while j >= 0 and skeleton[j] in " \t\r\n":
+            j -= 1
+        if j < 0:
+            return None, None
+        if skeleton[j] == ")":
+            depth, k = 0, j
+            while k >= 0:
+                if skeleton[k] == ")":
+                    depth += 1
+                elif skeleton[k] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k -= 1
+            if k < 0:
+                return None, None
+            name, start = trailing_ident(skeleton, k)
+            if name is None:
+                return None, None
+            if name in ATTR_CALLS:       # e.g. __attribute__((noreturn))
+                j = start - 1
+                continue
+            return k, name
+        name, start = trailing_ident(skeleton, j + 1)
+        if name is not None and bare_qualifier(name):   # `const`, OS_ALWAYS_INLINE
+            j = start - 1
+            continue
+        return None, None
+    return None, None
+
+
 def find_functions(skeleton, src):
     """Find function bodies using XNU's column-0 brace style.
 
-    A function body is a '{' in column 0 whose previous non-space character is
-    ')', running to the next '}' in column 0. Returns a list of
+    A function body is a '{' in column 0 whose declarator resolves per
+    `declarator()`, running to the next '}' in column 0. Returns a list of
     (body_start, body_end, name, header).
     """
     funcs = []
     for m in re.finditer(r"^\{", skeleton, re.M):
         bstart = m.start()
-        j = bstart - 1
-        while j >= 0 and skeleton[j] in " \t\r\n":
-            j -= 1
-        if j < 0 or skeleton[j] != ")":
+        k, name = declarator(skeleton, bstart)
+        if k is None:
             continue
-        # walk back to the matching '('
-        depth, k = 0, j
-        while k >= 0:
-            if skeleton[k] == ")":
-                depth += 1
-            elif skeleton[k] == "(":
-                depth -= 1
-                if depth == 0:
-                    break
-            k -= 1
-        if k < 0:
-            continue
-        name_m = IDENT_RE.search(skeleton[max(0, k - 300):k].rstrip())
-        if not name_m:
-            continue
-        name = name_m.group(0)
         end_m = re.compile(r"^\}", re.M).search(skeleton, bstart + 1)
         bend = end_m.start() if end_m else len(skeleton)
         hstart = max(0, k - 300)
