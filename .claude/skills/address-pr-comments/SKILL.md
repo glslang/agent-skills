@@ -50,15 +50,17 @@ gh pr view N --json headRepositoryOwner,headRepository,headRefName,maintainerCan
 # MCP: pull_request_read method:"get" → head.repo.owner.login, head.repo.name,
 #      head.ref, maintainer_can_modify
 head_ref=$(gh pr view N --json headRefName --jq '.headRefName')   # keep it in a variable
+# on a fork PR, the question is whether YOU can push to the head repo:
+gh api "repos/<headRepositoryOwner.login>/<headRepository.name>" --jq '.permissions.push'
 ```
 
 | Head repo | Push target |
 |---|---|
 | Same repo as base | `git push origin "HEAD:refs/heads/$head_ref"` |
-| A fork, `maintainerCanModify: true` | Add the contributor's repo as a remote, then push there: `git remote add contributor "https://github.com/<headRepositoryOwner.login>/<headRepository.name>.git"` and `git push contributor "HEAD:refs/heads/$head_ref"`. |
-| A fork, `maintainerCanModify: false` | **You cannot deliver fixes at all.** Say so before triaging and work the PR like the MCP-only path — replies, resolutions, issues. Authoring commits you can't push wastes the whole sweep. |
+| A fork you can push to | Add the contributor's repo as a remote, then push there: `git remote add contributor "https://github.com/<headRepositoryOwner.login>/<headRepository.name>.git"` and `git push contributor "HEAD:refs/heads/$head_ref"`. |
+| A fork you cannot push to | **You cannot deliver fixes at all.** Say so before triaging and work the PR like the MCP-only path — replies, resolutions, issues. Authoring commits you can't push wastes the whole sweep. |
 
-`maintainerCanModify` is only meaningful on a fork PR; it reads `false` on same-repo PRs, where it doesn't apply.
+**"Can push" is `.permissions.push` on the head repo, not `maintainerCanModify`.** That field is the contributor's *"Allow edits by maintainers"* checkbox, and all it does is extend push access on the fork branch to people who have write on the **base** repo. It is silent about you: run the session as the fork's owner or as a collaborator on it and you have write access whether or not the box is ticked. Read it backwards — `false` as "undeliverable" — and you drop to replies-only on a PR whose fixes you could have pushed. So check `.permissions.push` on the head repo first, and fall back to `maintainerCanModify` (plus push on the base repo) only when that comes back `false`. On a same-repo PR neither question arises; `maintainerCanModify` reads `false` there and means nothing.
 
 **Always the explicit refspec, always quoted.** Two independent reasons, neither cosmetic:
 
