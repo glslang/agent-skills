@@ -50,9 +50,13 @@ gh pr view N --json headRepositoryOwner,headRepository,headRefName,maintainerCan
 # MCP: pull_request_read method:"get" → head.repo.owner.login, head.repo.name,
 #      head.ref, maintainer_can_modify
 head_ref=$(gh pr view N --json headRefName --jq '.headRefName')   # keep it in a variable
+remote=origin                                                     # a fork PR reassigns this to the
+                                                                  # contributor remote added below
 # on a fork PR, the question is whether YOU can push to the head repo:
 gh api "repos/<headRepositoryOwner.login>/<headRepository.name>" --jq '.permissions.push'
 ```
+
+**`$remote` and `$head_ref` are set here, once, and every later push reads them** — §1's rebase, §5's normal push. Set them at this step even when you expect no fixes: the sweep that turns out to need one shouldn't have to rediscover where it pushes.
 
 | Head repo | Push target |
 |---|---|
@@ -297,7 +301,7 @@ If verification says it's wrong, **reply instead of editing**:
 - **Push to the target §0 established, with §0's quoted refspec** — never a bare `git push`, which fails outright on a fallback checkout and, where it does resolve, may be aimed at a branch of your own rather than the PR's head. Then prove the push landed by **equality**, not by change: a concurrent push satisfies "the head moved" while your work sits unpushed.
 
   ```bash
-  remote=origin                                      # or the fork's remote, per §0
+  # $remote and $head_ref come from §0
   expected=$(git rev-parse HEAD)
   git push "$remote" "HEAD:refs/heads/$head_ref"
   [ "$(git ls-remote "$remote" "refs/heads/$head_ref" | cut -f1)" = "$expected" ] \
