@@ -12,11 +12,19 @@ Claude Code cannot load — `description: "unterminated` and `name: "foo` are no
 valid YAML, and `description: null` has no description at all, but all three
 look fine to a pattern match. A validator that green-lights an unloadable skill
 is worse than no validator, so this uses a real parser.
+
+The README is checked in both directions: every skill needs a catalogue link,
+and every catalogue link needs a skill. Checking only the first leaves a
+renamed or deleted skill behind a broken link that CI reports as fine.
 """
 
 import re
 import sys
 from pathlib import Path
+
+# A Markdown link whose destination is a skill's SKILL.md, in either the plain
+# `](path)` or the angle-bracketed `](<path>)` form.
+SKILL_LINK = re.compile(r"\]\(<?(\.claude/skills/[^)>\s]+/SKILL\.md)>?\)")
 
 try:
     import yaml
@@ -46,13 +54,28 @@ def frontmatter(text):
     return rest[: end.start()]
 
 
-def linked_from_readme(readme, relative):
-    """True if the README links to `relative` as a Markdown link destination.
+def rendered(markdown):
+    """Strip what a reader never sees: fenced code blocks and HTML comments.
 
-    A bare mention — in prose, a code block, or an HTML comment — is not a
-    catalogue entry, so the path has to appear as an actual link target.
+    Both can hold text in exact Markdown link form — a commented-out catalogue
+    row is the usual way it happens — and neither puts a link on the rendered
+    page. Matching them would accept a skill that is missing from the visible
+    catalogue.
     """
+    without_fences = re.sub(r"^```[\s\S]*?^```", "", markdown, flags=re.MULTILINE)
+    return re.sub(r"<!--[\s\S]*?-->", "", without_fences)
+
+
+def linked_from_readme(readme, relative):
+    """True if the README links to `relative` as a visible Markdown link."""
     return f"]({relative})" in readme or f"](<{relative}>)" in readme
+
+
+def stale_readme_links(readme, directories):
+    """Catalogue links pointing at skills that no longer exist."""
+    linked = set(SKILL_LINK.findall(readme))
+    existing = {(d / "SKILL.md").relative_to(REPO).as_posix() for d in directories}
+    return sorted(linked - existing)
 
 
 def check_skill(directory, readme):
@@ -111,9 +134,15 @@ def main():
     if not directories:
         errors.append(f"{SKILLS}: no skill directories found")
 
-    readme = README.read_text(encoding="utf-8")
+    readme = rendered(README.read_text(encoding="utf-8"))
     for directory in directories:
         errors.extend(check_skill(directory, readme))
+
+    for link in stale_readme_links(readme, directories):
+        errors.append(
+            f"README.md: links to {link}, which does not exist — "
+            f"remove the row, or restore the skill if it was renamed"
+        )
 
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
