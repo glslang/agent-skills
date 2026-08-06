@@ -63,5 +63,6 @@ Two ways:
 CI checks steps 1, 2 and 4 on every push and PR. Run it locally with:
 
 ```bash
+pip install -r .github/requirements.txt
 python .github/scripts/validate_skills.py
 ```
