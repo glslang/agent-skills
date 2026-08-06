@@ -1,0 +1,3 @@
+# Tooling for the CI checks in .github/workflows/ci.yml.
+# The skills' own bundled scripts stay stdlib-only — this is not their dependency.
+PyYAML==6.0.2

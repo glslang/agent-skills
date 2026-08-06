@@ -1,8 +1,6 @@
 version: 2
 
 updates:
-  # The repo ships no package manifests — the skills' bundled scripts are
-  # stdlib-only Python — so GitHub Actions is the only ecosystem to track.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -11,5 +9,18 @@ updates:
       prefix: ci
     groups:
       github-actions:
+        patterns:
+          - "*"
+
+  # CI tooling only (.github/requirements.txt). The skills' own bundled scripts
+  # are stdlib-only and have no manifest, so nothing else here is tracked.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      ci-tooling:
         patterns:
           - "*"
