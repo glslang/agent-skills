@@ -54,8 +54,8 @@ Use `disarm` as a format-aware binary inspector, ARM64 disassembler, dumper, sea
 ## Preserve evidence and files
 
 - Treat target binaries as read-only by default. Parsing or disassembling a binary does not execute it.
-- Recognize side effects: `-e` writes an extracted file; `--companion` and `--analyze` create a companion in the target directory or current directory; the current `-P` implementation creates/truncates `/tmp/out`.
-- Before any patch, check whether `/tmp/out` already exists and stop for user direction rather than overwriting it. Verify the exact preimage/postimage bytes and move the result to a deliberate path only after validation. Expect Mach-O code signatures to become invalid.
+- Recognize side effects: `-e` writes an extracted file; `--companion` and `--analyze` create a companion in the target directory or current directory; the current `-P` implementation creates/truncates `/tmp/out` without an atomic no-clobber option.
+- Invoke `-P` only inside an isolated environment whose filesystem root and `/tmp` are private and not host-mounted. A host-side existence or symlink check is race-prone and is not a safety guarantee. If isolation is unavailable, use another patcher with an explicit atomic/no-clobber destination. Verify the exact preimage/postimage bytes before exporting the result, and expect Mach-O code signatures to become invalid.
 - Before analysis, choose the working directory deliberately and list existing companion files. `disarm` refuses to overwrite them; do not delete or replace one without user authorization.
 - Keep raw command output or extracted artifacts only when the user asks for them. Report every created path.
 
