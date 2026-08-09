@@ -112,7 +112,7 @@ disarm -r .rdata <pe>
 
 ```bash
 disarm -r entitlements <macho>
-disarm -r 'entitlements DER' <macho> | openssl asn1parse -inform DER -
+disarm -r 'entitlements DER' <macho> | openssl asn1parse -inform DER
 ```
 
 The first dumps legacy XML entitlements when present. The second emits DER data for external ASN.1 parsing.
