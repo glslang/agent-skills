@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Binaries with disarm"
+  short_description: "Inspect, disassemble, and analyze binaries"
+  default_prompt: "Use $use-disarm to inspect and reverse engineer this binary with disarm."
