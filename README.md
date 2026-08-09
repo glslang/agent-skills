@@ -26,6 +26,7 @@ Every skill directory sits directly under `.claude/skills/` — that flat layout
 
 | Skill | What it does |
 |---|---|
+| [`use-disarm`](.claude/skills/use-disarm/SKILL.md) | Uses `disarm` as a format-aware Mach-O/ELF/PE inspector, ARM64 disassembler, smart dumper, search/reference/gadget finder, and symbolication engine. Covers address/offset mapping, extraction, signatures, safe patching, companions, and all matcher families. |
 | [`improve-xnu-matchers`](.claude/skills/improve-xnu-matchers/SKILL.md) | Grows a `disarm`/`jtool2` `.matchers` file by mining XNU source for the string literals that identify kernel functions, so more of a stripped kernelcache gets symbolicated. Scans a local tree or the matching `apple-oss-distributions/xnu` tag, derives `arg#\|pattern\|containing_function\|calling_function` rules (handling the macro and inlining rewrites that shift the argument index), then gates every candidate against the real kernel — string presence, plus `LC_FUNCTION_STARTS` and ADRP/ADD xrefs to catch inlined functions and prove which argument register the string lands in. Only ever appends. |
 
 ## Using a skill in another repo
