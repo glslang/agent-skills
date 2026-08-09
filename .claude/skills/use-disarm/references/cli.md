@@ -230,15 +230,17 @@ For stable bindiff text, combine `NOOP=1` and/or `NOPC=1`. Do not combine `JCOLO
 ## Patching
 
 ```bash
-test ! -e /tmp/out
+# Run inside an isolated VM/container with a private filesystem root and /tmp.
 disarm '-P@0x<file-offset>=\xNN\xNN...' <file>
 ```
 
-In the February 2026 build, `-P` leaves the input unchanged and writes the reconstructed file to the fixed path `/tmp/out`. It opens that path with truncation. If `/tmp/out` exists, stop and ask the user how to preserve it; do not invoke `-P` first.
+In the February 2026 build, `-P` leaves the input unchanged and writes the reconstructed file to the fixed path `/tmp/out`. It opens that path with truncation and exposes neither a configurable destination nor an atomic no-clobber mode. A host-side existence/symlink check cannot make this safe: another process can create or replace the path between the check and `disarm` opening it.
+
+Never invoke this build's `-P` on a shared host. Run it only inside an isolated VM, container, or mount namespace whose filesystem root and `/tmp` are private and not bind-mounted from the host. If that is unavailable, use another patching tool that supports an explicit output path and atomic creation (`O_EXCL`/no-clobber behavior).
 
 Use a file offset, not a virtual address; resolve it with `-A` first. Encode binary bytes as shell-preserved `\xNN` escapes. Unescaped `41424344` means the eight ASCII characters, not four hexadecimal bytes.
 
-After patching, compare the source and `/tmp/out`, verify the exact changed range, and run targeted disassembly on `/tmp/out`. Move it to a user-selected path only after verification. Patching signed Mach-O content invalidates the original signature relationship even though the signature blob remains present.
+Inside the isolated environment, compare the source and `/tmp/out`, verify the exact changed range, and run targeted disassembly on `/tmp/out`. Export it to a user-selected path only after verification. Patching signed Mach-O content invalidates the original signature relationship even though the signature blob remains present.
 
 ## Practical workflows
 
