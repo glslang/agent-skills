@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze XNU Dumps with Xn00p"
+  short_description: "Inspect offline XNU kernel-memory dumps"
+  default_prompt: "Use $use-xnoop to analyze this offline XNU kernel-memory dump with Xn00p."
