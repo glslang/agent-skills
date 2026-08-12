@@ -70,6 +70,13 @@ xnoop_binary="$binary_directory/$(basename "$xnoop_binary")"
 
 dump_directory="$(cd "$dump_directory" && pwd -P)"
 
+case "$dump_directory" in
+  *$'\n'*|*$'\r'*)
+    printf 'error: dump directory must not contain newlines\n' >&2
+    exit 2
+    ;;
+esac
+
 [[ -f "$dump_directory/set.out" ]] || {
   printf 'error: dump directory has no set.out: %s\n' "$dump_directory" >&2
   exit 2
@@ -77,6 +84,11 @@ dump_directory="$(cd "$dump_directory" && pwd -P)"
 
 compgen -G "$dump_directory/*.mem" >/dev/null || compgen -G "$dump_directory/*.zone" >/dev/null || {
   printf 'error: dump directory has no .mem or .zone fragments: %s\n' "$dump_directory" >&2
+  exit 2
+}
+
+compgen -G "$dump_directory/xn00p.types.*" >/dev/null || {
+  printf 'error: dump directory has no Xn00p type library: %s\n' "$dump_directory" >&2
   exit 2
 }
 

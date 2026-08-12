@@ -90,7 +90,7 @@ Xn00p supports internal `>` output redirection, but the runner blocks it. If the
 | `pages <zone-name>` | Walk the zone's page queues. Spaces in a zone name remain part of the quoted runner argument. Missing metadata fragments can truncate queues. |
 | `walk zone [zone-name]` | Build-dependent zone walker. This fixture's build has emitted only a placeholder for some forms; prefer `zprint` plus `pages`. |
 | `pmap` | Walk the kernel pmap. Potentially broad. |
-| `pmap save` | Writes mapped data; do not use by default. |
+| `pmap <argument>` | Blocked by the runner because `pmap save` writes mapped data; do not pass any argument to `pmap`. |
 | `ptov <address>` | Translate an address using the target's physical/virtual mapping data. Validate whether the input is physical or virtual from the result. |
 
 ### Processes and kernel structures
@@ -104,7 +104,7 @@ Xn00p supports internal `>` output redirection, but the runner blocks it. If the
 | `pid <pid> mem` | Focus on process memory/map state. |
 | `ps` | Walk all processes. This command produced `SIGBUS` on the supplied fixture; prefer `pid` for known targets. |
 | `task <absolute-task-address>` | Inspect a task address; Xn00p expects it to reside in the task/proc-task zone. |
-| `walk <zone|proc|task|kmod>` | Traverse a supported kernel structure family. Treat placeholder, incomplete-read, or crash output as a limitation. |
+| `walk <family>` | Traverse the `zone`, `proc`, `task`, or `kmod` structure family. Treat placeholder, incomplete-read, or crash output as a limitation. |
 | `kexts` | Dump loaded-kext summaries. |
 | `macp` | Dump loaded MAC policies. |
 | `ioreg [arguments]` | Dump or search the I/O Registry. Start narrowly where arguments are supported. |

@@ -19,7 +19,7 @@ Use Xn00p as a read-only, offline XNU memory-forensics tool. Preserve target ide
 
 - Honor the supplied LITE binary's banner: it restricts use to eligible OBTS 8.0 participants, offline, for personal and non-commercial use. Stop if the requested use falls outside those terms.
 - Analyze only dumps the user is authorized to inspect. Kernel memory may contain credentials, tokens, messages, paths, or other private data; search narrowly and redact unrelated sensitive values from reports.
-- Stay offline. Do not use `remote`, `image`, `plugin`, or `unsafe`. Do not use Xn00p's internal `>` redirection or `pmap save` unless the user explicitly requests an artifact and approves its path.
+- Stay offline. Do not use `remote`, `image`, `plugin`, or `unsafe`. Do not use Xn00p's internal `>` redirection, `pmap save`, or any other argument-bearing `pmap` command.
 - Treat the dump and `set.out` as immutable evidence. Do not edit, rename, or regenerate their fragments.
 
 ## Prepare
