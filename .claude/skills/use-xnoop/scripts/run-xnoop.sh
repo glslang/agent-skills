@@ -82,15 +82,19 @@ esac
   exit 2
 }
 
-compgen -G "$dump_directory/*.mem" >/dev/null || compgen -G "$dump_directory/*.zone" >/dev/null || {
-  printf 'error: dump directory has no .mem or .zone fragments: %s\n' "$dump_directory" >&2
-  exit 2
-}
+(
+  cd "$dump_directory"
 
-compgen -G "$dump_directory/xn00p.types.*" >/dev/null || {
-  printf 'error: dump directory has no Xn00p type library: %s\n' "$dump_directory" >&2
-  exit 2
-}
+  compgen -G '*.mem' >/dev/null || compgen -G '*.zone' >/dev/null || {
+    printf 'error: dump directory has no .mem or .zone fragments: %s\n' "$dump_directory" >&2
+    exit 2
+  }
+
+  compgen -G 'xn00p.types.*' >/dev/null || {
+    printf 'error: dump directory has no Xn00p type library: %s\n' "$dump_directory" >&2
+    exit 2
+  }
+)
 
 ((${#commands[@]})) || {
   printf 'error: provide at least one quoted Xn00p command\n' >&2
